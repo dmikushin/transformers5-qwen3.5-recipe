@@ -11,7 +11,6 @@ from types import MethodType
 from typing import Any, cast
 
 import torch
-import torch_ggml_ops  # noqa: F401 Register the native packed operators.
 import triton
 from liger_kernel.ops.cross_entropy import liger_cross_entropy_kernel
 from liger_kernel.ops.fused_linear_cross_entropy import (
@@ -24,6 +23,7 @@ from liger_kernel.transformers.model.output_classes import (
     LigerMoeCausalLMOutputWithPast,
 )
 from torch import nn
+from torch_ggml_ops import mmq_grad_input_inplace, mmq_inplace
 from transformers.integrations.gguf import GGUFLinear
 from transformers.integrations.gguf_dequant import GGUFQuantizedTensor
 from transformers.modeling_outputs import MoeModelOutputWithPast
@@ -87,7 +87,16 @@ def _packed_q8_linear_cross_entropy_forward(
     total_n_non_ignore = target_mask.sum().item()
     block_size = min(MAX_FUSED_SIZE, triton.next_power_of_2(out_features))
 
-    grad_input = torch.zeros_like(input)
+    grad_input = torch.empty_like(input)
+    buffer_rows = min(rows, chunk_size)
+    logits_buffer = torch.empty(
+        (buffer_rows, out_features), dtype=input.dtype, device=input.device
+    )
+    workspace_buffer = torch.empty(
+        buffer_rows * hidden_size // 128 * 144,
+        dtype=torch.uint8,
+        device=input.device,
+    )
     loss_1d = torch.zeros(rows, dtype=torch.float32, device=input.device)
     token_accuracy_1d = (
         torch.zeros(rows, dtype=torch.float32, device=input.device)
@@ -102,15 +111,17 @@ def _packed_q8_linear_cross_entropy_forward(
 
     for start in range(0, rows, chunk_size):
         end = min(start + chunk_size, rows)
-        # Native MMQ intentionally rejects nonzero storage offsets. This small,
-        # explicit BF16 copy is at most 1 MiB for the given chunk size
-        # and remains separate from the much larger logits workspace.
-        input_chunk = input[start:end].clone()
-        logits_chunk = torch.ops.torch_ggml_ops.mmq.default(
+        input_chunk = input[start:end]
+        chunk_rows = end - start
+        logits_chunk = logits_buffer[:chunk_rows]
+        workspace_chunk = workspace_buffer[: chunk_rows * hidden_size // 128 * 144]
+        mmq_inplace(
             input_chunk,
             packed_weight,
             quant_type,
             out_features,
+            logits_chunk,
+            workspace_chunk,
         )
         target_chunk = target[start:end].contiguous()
         loss_1d_slice = loss_1d[start:end]
@@ -169,11 +180,12 @@ def _packed_q8_linear_cross_entropy_forward(
             num_warps=16 if is_hip() else 32,
         )
 
-        grad_input[start:end] = torch.ops.torch_ggml_ops.mmq_grad_input.default(
+        mmq_grad_input_inplace(
             logits_chunk,
             packed_weight,
             quant_type,
             hidden_size,
+            grad_input[start:end],
         )
 
     loss = torch.sum(loss_1d)

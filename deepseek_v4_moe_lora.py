@@ -14,7 +14,7 @@ from fast_moe_lora import (
     qwen3_5_moe_gguf_mmq_aiter_lora_forward,
 )
 
-EXPERTS_IMPLEMENTATION = "deepseek_v4_gguf_dequant_aiter_lora"
+EXPERTS_IMPLEMENTATION = "deepseek_v4_gguf_mmq_aiter_lora"
 _LORA_WEIGHTS_KWARG = "_deepseek_v4_gguf_lora_weights"
 
 
@@ -41,14 +41,14 @@ class DeepseekV4GGUFMoeLora(FastGGUFMoeLora):
         return self.base_layer(hidden_states, *args, **kwargs)
 
 
-def deepseek_v4_gguf_dequant_aiter_lora_forward(
+def deepseek_v4_gguf_mmq_aiter_lora_forward(
     self: Any,
     hidden_states: torch.Tensor,
     top_k_index: torch.Tensor,
     top_k_weights: torch.Tensor,
     _deepseek_v4_gguf_lora_weights: _ExpertLoraWeights | None = None,
 ) -> torch.Tensor:
-    """Run split packed experts with generic dequantization and AITER grouped MM."""
+    """Run packed GGTensile base MMQ and AITER LoRA grouped MM."""
 
     if not isinstance(self, DeepseekV4GGUFExperts):
         raise TypeError(
@@ -87,7 +87,7 @@ def register_deepseek_v4_moe_lora(
         target_modules.add("experts")
         lora_config.__dict__["target_modules"] = target_modules
     ALL_GGUF_EXPERTS_FUNCTIONS[EXPERTS_IMPLEMENTATION] = (
-        deepseek_v4_gguf_dequant_aiter_lora_forward
+        deepseek_v4_gguf_mmq_aiter_lora_forward
     )
     cast(Any, model).set_experts_implementation(EXPERTS_IMPLEMENTATION)
     register({DeepseekV4GGUFExperts: DeepseekV4GGUFMoeLora})

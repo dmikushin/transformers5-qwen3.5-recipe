@@ -41,7 +41,7 @@ class _MMQCounter(TorchDispatchMode):
 
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
         name = str(func)
-        if name.startswith("torch_ggml_ops.mmq"):
+        if name.startswith("torch_ggml_ops._mmq"):
             self.counts[name] += 1
         return func(*args, **(kwargs or {}))
 
@@ -52,10 +52,8 @@ def q6_lm_head() -> GGUFLinear:
         pytest.skip("GGUF model is unavailable")
     reader = gguf.GGUFReader(_MODEL)
     tensor = next(tensor for tensor in reader.tensors if tensor.name == "output.weight")
-    out_features = 37
-    packed_host = np.array(
-        tensor.data[:out_features], dtype=np.uint8, copy=True, order="C"
-    )
+    out_features = int(tensor.data.shape[0])
+    packed_host = np.array(tensor.data, dtype=np.uint8, copy=True, order="C")
     packed = torch.from_numpy(packed_host).to("cuda")
     module = GGUFLinear(
         2048,
@@ -78,7 +76,7 @@ def test_packed_q8_liger_loss_matches_logical_reference_and_uses_native_ops(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     generator = torch.Generator(device="cuda").manual_seed(12345)
-    rows = _PACKED_LM_HEAD_CHUNK_SIZE + 1
+    rows = 2 * _PACKED_LM_HEAD_CHUNK_SIZE
     hidden_reference = torch.randn(
         1,
         rows,
@@ -165,8 +163,11 @@ def test_packed_q8_liger_loss_matches_logical_reference_and_uses_native_ops(
     assert q6_lm_head.weight.grad is None
     assert _PACKED_LM_HEAD_CHUNK_SIZE == 256
     expected_calls = math.ceil(rows / _PACKED_LM_HEAD_CHUNK_SIZE)
-    assert counter.counts["torch_ggml_ops.mmq.default"] == expected_calls
-    assert counter.counts["torch_ggml_ops.mmq_grad_input.default"] == expected_calls
+    assert counter.counts["torch_ggml_ops._mmq_launch.default"] == expected_calls
+    assert (
+        counter.counts["torch_ggml_ops._mmq_grad_input_launch.default"]
+        == expected_calls
+    )
 
 
 @pytest.mark.parametrize(
@@ -200,9 +201,9 @@ def test_packed_q8_liger_loss_rejects_higher_order_gradients(
     q6_lm_head: GGUFLinear,
 ) -> None:
     hidden = torch.randn(
-        1, 2, 2048, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        1, 64, 2048, device="cuda", dtype=torch.bfloat16, requires_grad=True
     )
-    labels = torch.tensor([[3, 5]], device="cuda")
+    labels = torch.randint(0, q6_lm_head.out_features, (1, 64), device="cuda")
     loss = _packed_q8_liger_for_causal_lm_loss(
         hidden_states=hidden,
         lm_head=q6_lm_head,

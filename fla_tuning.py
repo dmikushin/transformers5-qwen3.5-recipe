@@ -6,7 +6,7 @@ from triton.runtime.autotuner import Autotuner
 
 # Entries are (module, outer decorated kernel, exact Triton cache key, config).
 # They were selected on Radeon 8060S / gfx1151 for Qwen3.5-35B-A3B training:
-# B=4, T=2048, H=HV=32, K=V=128, BF16 q/k/v/beta, FP32 gate,
+# B in {1, 4}, T=2048, H=HV=32, K=V=128, BF16 q/k/v/beta, FP32 gate,
 # no recurrent state, no varlen metadata, and fused Q/K L2 normalization.
 _KNOWN_CONFIGS: tuple[tuple[str, str, tuple[Any, ...], dict[str, Any]], ...] = (
     (
@@ -32,6 +32,26 @@ _KNOWN_CONFIGS: tuple[tuple[str, str, tuple[Any, ...], dict[str, Any]], ...] = (
         "layer_norm_gated_bwd_kernel",
         (
             128,
+            1,
+            True,
+            False,
+            True,
+            "torch.bfloat16",
+            "torch.bfloat16",
+            "torch.bfloat16",
+            "torch.bfloat16",
+            "torch.bfloat16",
+            "torch.bfloat16",
+            "torch.float32",
+            "torch.float32",
+        ),
+        {"kwargs": {"BT": 32}, "num_warps": 4, "num_stages": 3},
+    ),
+    (
+        "fla.modules.fused_norm_gate",
+        "layer_norm_gated_bwd_kernel",
+        (
+            128,
             4,
             True,
             False,
@@ -51,6 +71,19 @@ _KNOWN_CONFIGS: tuple[tuple[str, str, tuple[Any, ...], dict[str, Any]], ...] = (
         "fla.modules.l2norm",
         "l2norm_fwd_kernel",
         (128, 4, "torch.bfloat16", "torch.bfloat16", "torch.float32"),
+        {"kwargs": {"BT": 16}, "num_warps": 16, "num_stages": 3},
+    ),
+    (
+        "fla.modules.l2norm",
+        "l2norm_bwd_kernel",
+        (
+            128,
+            1,
+            "torch.bfloat16",
+            "torch.float32",
+            "torch.bfloat16",
+            "torch.bfloat16",
+        ),
         {"kwargs": {"BT": 16}, "num_warps": 16, "num_stages": 3},
     ),
     (
@@ -243,6 +276,12 @@ _KNOWN_CONFIGS: tuple[tuple[str, str, tuple[Any, ...], dict[str, Any]], ...] = (
         "fla.ops.utils.cumsum",
         "chunk_local_cumsum_scalar_kernel",
         (4, 32, 64, False, False, "torch.float32", "torch.float32"),
+        {"kwargs": {}, "num_warps": 1, "num_stages": 3},
+    ),
+    (
+        "fla.ops.utils.cumsum",
+        "chunk_local_cumsum_scalar_kernel",
+        (1, 32, 64, False, True, "torch.float32", "torch.float32"),
         {"kwargs": {}, "num_warps": 1, "num_stages": 3},
     ),
     (

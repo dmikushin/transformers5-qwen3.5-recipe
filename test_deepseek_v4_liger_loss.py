@@ -1,5 +1,9 @@
+import os
+from pathlib import Path
+
 import gguf
 import numpy as np
+import pytest
 import torch
 from liger_kernel.transformers.model.loss_utils import LigerForCausalLMLoss
 from torch.utils._python_dispatch import TorchDispatchMode
@@ -9,6 +13,13 @@ from transformers.integrations.gguf_dequant import GGUFQuantizedTensor
 from deepseek_v4_liger_loss import (
     deepseek_v4_liger_causal_lm_loss,
     deepseek_v4_packed_liger_causal_lm_loss,
+)
+
+_MODEL = Path(
+    os.environ.get(
+        "GGUF_DEEPSEEK_MMQ_TEST_MODEL",
+        os.path.expanduser("~/models/ds4/DeepSeek-V4-Flash-IQ2XXS.gguf"),
+    )
 )
 
 
@@ -88,21 +99,39 @@ def test_scoped_q8_0_liger_loss_matches_logical_reference() -> None:
 
 
 def test_packed_q8_0_liger_loss_uses_native_mmq_without_materializing_head() -> None:
+    if not _MODEL.is_file():
+        pytest.skip("DeepSeek GGUF model is unavailable")
     torch.manual_seed(9753)
-    generator = np.random.default_rng(9753)
-    head = _q8_lm_head(generator.standard_normal((37, 256)))
+    reader = gguf.GGUFReader(_MODEL)
+    tensor = next(item for item in reader.tensors if item.name == "output.weight")
+    packed_weight = torch.from_numpy(
+        np.array(tensor.data, dtype=np.uint8, copy=True, order="C")
+    ).to("cuda")
+    head = GGUFLinear(
+        4096,
+        129280,
+        bias=False,
+        device="cuda",
+        dtype=torch.bfloat16,
+        compute_dtype=torch.bfloat16,
+    )
+    head.weight = GGUFQuantizedTensor(
+        packed_weight,
+        quant_type=tensor.tensor_type,
+        logical_shape=(129280, 4096),
+    )
     hidden_reference = torch.randn(
-        2, 17, 256, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        1, 32, 4096, device="cuda", dtype=torch.bfloat16, requires_grad=True
     )
     hidden_packed = hidden_reference.detach().clone().requires_grad_(True)
-    labels = torch.randint(0, 37, (2, 17), device="cuda")
-    labels[1, 4] = -100
+    labels = torch.randint(0, 129280, (1, 32), device="cuda")
+    labels[0, 4] = -100
 
     reference = deepseek_v4_liger_causal_lm_loss(
         hidden_reference,
         head,
         labels,
-        hidden_size=256,
+        hidden_size=4096,
     )
     reference.backward()
 
@@ -127,12 +156,12 @@ def test_packed_q8_0_liger_loss_uses_native_mmq_without_materializing_head() -> 
             hidden_packed,
             head,
             labels,
-            hidden_size=256,
+            hidden_size=4096,
         )
         packed.backward()
 
     torch.testing.assert_close(packed, reference, rtol=1e-3, atol=1e-3)
     assert materializations == 0
-    assert "torch_ggml_ops.mmq.default" in operations
-    assert "torch_ggml_ops.mmq_grad_input.default" in operations
+    assert "torch_ggml_ops._mmq_launch.default" in operations
+    assert "torch_ggml_ops._mmq_grad_input_launch.default" in operations
     assert torch.isfinite(_require_grad(hidden_packed)).all()

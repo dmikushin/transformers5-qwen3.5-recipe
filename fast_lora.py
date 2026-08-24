@@ -11,7 +11,7 @@ cannot merge adapter deltas into their packed physical weights. MoE adapters
 are handled separately by ``fast_moe_lora.py``.
 """
 
-from typing import Any, cast
+from typing import Any
 
 import torch
 from peft import LoraConfig
@@ -20,15 +20,6 @@ from peft.tuners.lora.layer import Linear as PeftLinear
 from torch_ggml_ops import mmq
 from transformers.integrations.gguf import GGUFLinear
 from transformers.integrations.gguf_dequant import GGUFQuantizedTensor
-
-# GGML quantization type IDs supported by the installed torch-ggml-ops wheel.
-# The original Qwen integration covered IQ2_S/Q3_K/Q4_K/Q5_K/Q6_K. The
-# DeepSeek-V4 wheel adds Q8_0, Q2_K, and IQ2_XXS.
-_NATIVE_MMQ_QUANT_TYPES = frozenset({8, 10, 11, 12, 13, 14, 16, 22})
-
-
-def supports_native_mmq(weight: GGUFQuantizedTensor) -> bool:
-    return int(cast(Any, weight.quant_type)) in _NATIVE_MMQ_QUANT_TYPES
 
 
 def _fused_lora_add(
@@ -127,8 +118,8 @@ class FastLoraLinear(_FastLoraForwardMixin, PeftLinear):
 class FastGGUFLoraLinear(FastLoraLinear):
     """Fast LoRA wrapper for frozen packed ``GGUFLinear`` modules.
 
-    Supported quantization types use dense MMQ in both directions. Other
-    packed types stay on ``GGUFLinear.forward`` and its generic input Jacobian.
+    Unpermuted packed weights use exported dense MMQ in both directions.
+    Kernel support is authoritative in ``torch-ggml-ops`` and is not probed here.
     """
 
     def _base_layer_forward(
@@ -137,7 +128,6 @@ class FastGGUFLoraLinear(FastLoraLinear):
         base = self.base_layer
         if (
             not isinstance(base.weight, GGUFQuantizedTensor)
-            or not supports_native_mmq(base.weight)
             or base.input_permutation is not None
             or base.output_permutation is not None
         ):

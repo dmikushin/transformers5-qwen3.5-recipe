@@ -1,6 +1,9 @@
+import os
+from pathlib import Path
 from types import SimpleNamespace
 
 import gguf
+import numpy as np
 import pytest
 import torch
 from peft import LoraConfig
@@ -18,11 +21,11 @@ import fast_moe_lora
 from deepseek_v4_moe_lora import (
     EXPERTS_IMPLEMENTATION,
     DeepseekV4GGUFMoeLora,
-    deepseek_v4_gguf_dequant_aiter_lora_forward,
+    deepseek_v4_gguf_mmq_aiter_lora_forward,
 )
 from fast_moe_lora import (
-    _aiter_forward,
     _base_grouped_linear,
+    _base_grouped_pair,
     _group_sizes_from_offsets,
 )
 
@@ -52,79 +55,163 @@ class _RecordOps(TorchDispatchMode):
         return func(*args, **(kwargs or {}))
 
 
-def _packed_experts(
-    qtype: gguf.GGMLQuantizationType, value: int
-) -> GGUFQuantizedTensor:
-    type_size = gguf.GGML_QUANT_SIZES[qtype][1]
-    payload = torch.full((2, 256, type_size), value, device="cuda", dtype=torch.uint8)
+_MODEL = Path(
+    os.environ.get(
+        "GGUF_DEEPSEEK_MMQ_TEST_MODEL",
+        os.path.expanduser("~/models/ds4/DeepSeek-V4-Flash-IQ2XXS.gguf"),
+    )
+)
+
+
+@pytest.fixture(scope="module")
+def reader() -> gguf.GGUFReader:
+    if not _MODEL.is_file():
+        pytest.skip("DeepSeek GGUF model is unavailable")
+    return gguf.GGUFReader(_MODEL)
+
+
+def _packed_experts(reader: gguf.GGUFReader, projection: str) -> GGUFQuantizedTensor:
+    tensor = next(
+        item
+        for item in reader.tensors
+        if item.name == f"blk.0.ffn_{projection}_exps.weight"
+    )
+    payload = torch.from_numpy(
+        np.array(tensor.data, dtype=np.uint8, copy=True, order="C")
+    ).to("cuda")
     return GGUFQuantizedTensor(
         payload,
-        quant_type=qtype,
-        logical_shape=(2, 256, 256),
+        quant_type=tensor.tensor_type,
+        logical_shape=tuple(int(size) for size in reversed(tensor.shape)),
     )
 
 
-def test_iq2_xxs_and_q2_k_use_native_grouped_mmq_backward() -> None:
+def test_iq2_xxs_and_q2_k_use_native_grouped_mmq_backward(
+    reader: gguf.GGUFReader,
+) -> None:
+    generator = torch.Generator(device="cuda").manual_seed(2468)
     experts = torch.tensor([0, 1], device="cuda", dtype=torch.long)
-    offsets = torch.tensor([3, 7], device="cuda", dtype=torch.int32)
+    offsets = torch.tensor([4096, 12288], device="cuda", dtype=torch.int32)
     group_sizes = _group_sizes_from_offsets(offsets)
-    for qtype, value in (
-        (gguf.GGMLQuantizationType.IQ2_XXS, 32),
-        (gguf.GGMLQuantizationType.Q2_K, 32),
-    ):
-        weight = _packed_experts(qtype, value)
-        hidden = torch.randn(
-            7, 256, device="cuda", dtype=torch.bfloat16, requires_grad=True
-        )
-        grad_output = torch.randn(7, 256, device="cuda", dtype=torch.bfloat16)
-        recorder = _RecordOps()
-        with recorder:
-            output = _base_grouped_linear(
-                hidden,
-                weight,
-                experts,
-                offsets,
-                group_sizes,
-                torch.bfloat16,
-            )
-            output.backward(grad_output)
-        assert any(
-            "torch_ggml_ops.grouped_mmq.default" in operation
-            for operation in recorder.operations
-        )
-        assert any(
-            "torch_ggml_ops.grouped_mmq_grad_input.default" in operation
-            for operation in recorder.operations
-        )
+    probe_rows = (0, 4096)
 
-        logical = dequantize_gguf_tensor(
-            weight.as_subclass(torch.Tensor).index_select(0, experts),
-            qtype,
-            dtype=torch.bfloat16,
-            device="cuda",
+    gate = _packed_experts(reader, "gate")
+    up = _packed_experts(reader, "up")
+    hidden = torch.zeros(
+        12288, 4096, device="cuda", dtype=torch.bfloat16, requires_grad=True
+    )
+    gate_grad = torch.zeros(12288, 2048, device="cuda", dtype=torch.bfloat16)
+    up_grad = torch.zeros_like(gate_grad)
+    with torch.no_grad():
+        for row in probe_rows:
+            hidden[row].normal_(generator=generator)
+            gate_grad[row].normal_(generator=generator)
+            up_grad[row].normal_(generator=generator)
+
+    recorder = _RecordOps()
+    with recorder:
+        gate_output, up_output = _base_grouped_pair(
+            hidden,
+            gate,
+            up,
+            experts,
+            offsets,
+            group_sizes,
+            torch.bfloat16,
         )
-        expected_output = _aiter_forward(
-            hidden.detach(), logical.transpose(1, 2), group_sizes
+        torch.autograd.backward((gate_output, up_output), (gate_grad, up_grad))
+    assert "torch_ggml_ops._grouped_mmq_pair_launch.default" in recorder.operations
+    assert (
+        "torch_ggml_ops._grouped_mmq_pair_grad_input_launch.default"
+        in recorder.operations
+    )
+
+    logical_gate = dequantize_gguf_tensor(
+        gate.as_subclass(torch.Tensor).index_select(0, experts),
+        gate.quant_type,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    logical_up = dequantize_gguf_tensor(
+        up.as_subclass(torch.Tensor).index_select(0, experts),
+        up.quant_type,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    expected_grad = torch.zeros_like(hidden)
+    for group, row in enumerate(probe_rows):
+        torch.testing.assert_close(
+            gate_output[row],
+            torch.nn.functional.linear(hidden.detach()[row], logical_gate[group]),
+            rtol=2e-2,
+            atol=4e-2,
         )
-        expected_grad = torch.empty_like(hidden)
-        row_begin = 0
-        for group, row_end in enumerate(offsets.cpu().tolist()):
-            expected_grad[row_begin:row_end] = (
-                grad_output[row_begin:row_end].float() @ logical[group].float()
-            ).to(torch.bfloat16)
-            row_begin = row_end
-        torch.testing.assert_close(output, expected_output, rtol=1e-2, atol=1e-2)
-        torch.testing.assert_close(hidden.grad, expected_grad, rtol=1e-2, atol=1e-2)
-        assert weight.grad is None
+        torch.testing.assert_close(
+            up_output[row],
+            torch.nn.functional.linear(hidden.detach()[row], logical_up[group]),
+            rtol=2e-2,
+            atol=4e-2,
+        )
+        expected_grad[row] = (
+            gate_grad[row].float() @ logical_gate[group].float()
+            + up_grad[row].float() @ logical_up[group].float()
+        ).to(torch.bfloat16)
+    torch.testing.assert_close(hidden.grad, expected_grad, rtol=1e-2, atol=2e-2)
+    assert gate.grad is None and up.grad is None
+
+    down = _packed_experts(reader, "down")
+    intermediate = torch.zeros(
+        12288, 2048, device="cuda", dtype=torch.bfloat16, requires_grad=True
+    )
+    down_grad = torch.zeros(12288, 4096, device="cuda", dtype=torch.bfloat16)
+    with torch.no_grad():
+        for row in probe_rows:
+            intermediate[row].normal_(generator=generator)
+            down_grad[row].normal_(generator=generator)
+    recorder = _RecordOps()
+    with recorder:
+        down_output = _base_grouped_linear(
+            intermediate,
+            down,
+            experts,
+            offsets,
+            group_sizes,
+            torch.bfloat16,
+        )
+        down_output.backward(down_grad)
+    assert "torch_ggml_ops._grouped_mmq_launch.default" in recorder.operations
+    assert (
+        "torch_ggml_ops._grouped_mmq_grad_input_launch.default" in recorder.operations
+    )
+
+    logical_down = dequantize_gguf_tensor(
+        down.as_subclass(torch.Tensor).index_select(0, experts),
+        down.quant_type,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    expected_grad = torch.zeros_like(intermediate)
+    for group, row in enumerate(probe_rows):
+        torch.testing.assert_close(
+            down_output[row],
+            torch.nn.functional.linear(intermediate.detach()[row], logical_down[group]),
+            rtol=2e-2,
+            atol=5e-2,
+        )
+        expected_grad[row] = (down_grad[row].float() @ logical_down[group].float()).to(
+            torch.bfloat16
+        )
+    torch.testing.assert_close(intermediate.grad, expected_grad, rtol=1e-2, atol=2e-2)
+    assert down.grad is None
 
 
-def test_complete_deepseek_expert_lora_preserves_clamp_and_has_finite_gradients() -> (
-    None
-):
+def test_complete_deepseek_expert_lora_preserves_clamp_and_has_finite_gradients(
+    reader: gguf.GGUFReader,
+) -> None:
     config = SimpleNamespace(
-        num_experts=2,
-        hidden_size=256,
-        moe_intermediate_size=256,
+        num_experts=256,
+        hidden_size=4096,
+        moe_intermediate_size=2048,
         hidden_act="silu",
         swiglu_limit=0.05,
         _experts_implementation=EXPERTS_IMPLEMENTATION,
@@ -135,11 +222,11 @@ def test_complete_deepseek_expert_lora_preserves_clamp_and_has_finite_gradients(
         compute_dtype=torch.bfloat16,
     )
     experts.config = config
-    experts.gate_proj = _packed_experts(gguf.GGMLQuantizationType.IQ2_XXS, 32)
-    experts.up_proj = _packed_experts(gguf.GGMLQuantizationType.IQ2_XXS, 32)
-    experts.down_proj = _packed_experts(gguf.GGMLQuantizationType.Q2_K, 32)
+    experts.gate_proj = _packed_experts(reader, "gate")
+    experts.up_proj = _packed_experts(reader, "up")
+    experts.down_proj = _packed_experts(reader, "down")
     ALL_GGUF_EXPERTS_FUNCTIONS[EXPERTS_IMPLEMENTATION] = (
-        deepseek_v4_gguf_dequant_aiter_lora_forward
+        deepseek_v4_gguf_mmq_aiter_lora_forward
     )
 
     lora_config = LoraConfig(
@@ -170,12 +257,12 @@ def test_complete_deepseek_expert_lora_preserves_clamp_and_has_finite_gradients(
 
     experts.__dict__["_apply_split_gate"] = tracked_apply
     hidden = torch.randn(
-        6, 256, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        2048, 4096, device="cuda", dtype=torch.bfloat16, requires_grad=True
     )
-    top_k_index = torch.tensor([[0], [1], [0], [1], [0], [1]], device="cuda")
-    top_k_weights = torch.ones(
-        6, 1, device="cuda", dtype=torch.float32, requires_grad=True
-    )
+    top_k_index = torch.randn(2048, 256, device="cuda").topk(6, dim=-1).indices
+    top_k_weights = torch.softmax(
+        torch.randn(2048, 6, device="cuda", dtype=torch.float32), dim=-1
+    ).requires_grad_(True)
     output = layer(hidden, top_k_index, top_k_weights)
     output.float().square().mean().backward()
 

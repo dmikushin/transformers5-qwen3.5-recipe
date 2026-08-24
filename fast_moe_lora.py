@@ -24,12 +24,8 @@ from peft import LoraConfig
 from peft.tuners.lora.layer import LoraLayer
 from torch_ggml_ops import grouped_mmq, grouped_mmq_pair
 from transformers.integrations.gguf import ALL_GGUF_EXPERTS_FUNCTIONS, GGUFExperts
-from transformers.integrations.gguf_dequant import (
-    GGUFQuantizedTensor,
-    dequantize_gguf_tensor,
-)
+from transformers.integrations.gguf_dequant import GGUFQuantizedTensor
 
-from fast_lora import supports_native_mmq
 from fast_moe_routing import finalize_expert_routing, prepare_expert_routing
 from moe_gmm_configs import gmm_config as _gmm_config
 from moe_gmm_configs import ptgmm_config as _ptgmm_config
@@ -151,249 +147,22 @@ def aiter_grouped_mm(
     return _AiterGroupedMM.apply(lhs, rhs, group_sizes)
 
 
-def _dequantize_selected_experts(
-    weight: Any,
+def _native_grouped_arguments(
+    hidden_states: torch.Tensor,
     expert_indices: torch.Tensor,
-    dtype: torch.dtype,
-    device: torch.device,
-) -> torch.Tensor:
-    if isinstance(weight, GGUFQuantizedTensor):
-        payload = weight.as_subclass(torch.Tensor)
-        selected = payload.index_select(0, expert_indices.to(payload.device))
-        return dequantize_gguf_tensor(
-            selected, weight.quant_type, dtype=dtype, device=device
-        )
-    if not weight.is_floating_point():
-        raise RuntimeError(
-            "GGUF expert weights must be packed or floating point before AITER execution."
-        )
-    return weight.index_select(0, expert_indices.to(weight.device)).to(
-        device=device, dtype=dtype
-    )
-
-
-class _AiterGGUFExpertProjection(torch.autograd.Function):
-    """Run native packed MMQ or generic dequantized AITER grouped MM."""
-
-    @staticmethod
-    def forward(
-        ctx,
-        hidden_states: torch.Tensor,
-        weight: Any,
-        expert_indices: torch.Tensor,
-        expert_offsets: torch.Tensor,
-        group_sizes: torch.Tensor,
-        compute_dtype: torch.dtype,
-    ) -> torch.Tensor:
-        if weight.requires_grad:
-            raise RuntimeError(
-                "Fast GGUF expert execution requires frozen packed base weights."
-            )
-        input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(compute_dtype).contiguous()
-        expert_indices = expert_indices.to(
-            device=hidden_states.device, dtype=torch.long
-        ).contiguous()
-        expert_offsets = expert_offsets.to(
-            device=hidden_states.device, dtype=torch.int32
-        ).contiguous()
-        group_sizes = group_sizes.to(
-            device=hidden_states.device, dtype=torch.int32
-        ).contiguous()
-
-        ctx.compute_dtype = compute_dtype
-        ctx.input_dtype = input_dtype
-        ctx.quant_type = (
-            weight.quant_type if isinstance(weight, GGUFQuantizedTensor) else None
-        )
-        ctx.is_packed = isinstance(weight, GGUFQuantizedTensor)
-        ctx.native_packed = ctx.is_packed and supports_native_mmq(weight)
-        ctx.in_features = (
-            int(weight.logical_shape[-1]) if ctx.is_packed else int(weight.shape[-1])
-        )
-
-        if ctx.native_packed:
-            if compute_dtype != torch.bfloat16:
-                raise RuntimeError("Grouped GGUF MMQ requires BF16 compute dtype.")
-            payload = weight.as_subclass(torch.Tensor)
-            if ctx.needs_input_grad[0]:
-                ctx.save_for_backward(payload, expert_indices, expert_offsets)
-            return grouped_mmq(
-                hidden_states,
-                payload,
-                expert_indices,
-                expert_offsets,
-                int(weight.quant_type),
-                int(weight.logical_shape[-2]),
-            )
-
-        if ctx.is_packed:
-            payload = weight.as_subclass(torch.Tensor)
-            selected_weight = payload.index_select(0, expert_indices.to(payload.device))
-            if ctx.needs_input_grad[0]:
-                ctx.save_for_backward(selected_weight, expert_indices, group_sizes)
-            dense_weight = dequantize_gguf_tensor(
-                selected_weight,
-                weight.quant_type,
-                dtype=compute_dtype,
-                device=hidden_states.device,
-            )
-        else:
-            if ctx.needs_input_grad[0]:
-                ctx.save_for_backward(weight, expert_indices, group_sizes)
-            dense_weight = _dequantize_selected_experts(
-                weight, expert_indices, compute_dtype, hidden_states.device
-            )
-        return _aiter_forward(hidden_states, dense_weight.transpose(1, 2), group_sizes)
-
-    @staticmethod
-    def backward(ctx, grad_output: torch.Tensor):  # ty: ignore[invalid-method-override]
-        grad_hidden = None
-        if ctx.needs_input_grad[0]:
-            payload, expert_indices, grouped_metadata = ctx.saved_tensors
-            if ctx.native_packed:
-                grad_hidden = torch.ops.torch_ggml_ops.grouped_mmq_grad_input.default(
-                    grad_output.contiguous(),
-                    payload,
-                    expert_indices,
-                    grouped_metadata,
-                    int(ctx.quant_type),
-                    ctx.in_features,
-                )
-            elif ctx.is_packed:
-                dense_weight = dequantize_gguf_tensor(
-                    payload,
-                    ctx.quant_type,
-                    dtype=ctx.compute_dtype,
-                    device=grad_output.device,
-                )
-                grad_hidden = _aiter_input_grad(
-                    grad_output, dense_weight.transpose(1, 2), grouped_metadata
-                )
-            else:
-                dense_weight = payload.index_select(
-                    0, expert_indices.to(payload.device)
-                ).to(device=grad_output.device, dtype=ctx.compute_dtype)
-                grad_hidden = _aiter_input_grad(
-                    grad_output, dense_weight.transpose(1, 2), grouped_metadata
-                )
-            grad_hidden = grad_hidden.to(ctx.input_dtype)
-        return grad_hidden, None, None, None, None, None
-
-
-class _AiterGGUFExpertPairProjection(torch.autograd.Function):
-    """Fuse packed gate/up forward workspaces and backward input accumulation."""
-
-    @staticmethod
-    def forward(
-        ctx,
-        hidden_states: torch.Tensor,
-        first_weight: Any,
-        second_weight: Any,
-        expert_indices: torch.Tensor,
-        expert_offsets: torch.Tensor,
-        group_sizes: torch.Tensor,
-        compute_dtype: torch.dtype,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if first_weight.requires_grad or second_weight.requires_grad:
-            raise RuntimeError(
-                "Fast GGUF expert execution requires frozen packed base weights."
-            )
-        if compute_dtype != torch.bfloat16:
-            raise RuntimeError("Grouped GGUF MMQ requires BF16 compute dtype.")
-        if first_weight.quant_type != second_weight.quant_type:
-            raise RuntimeError(
-                "Paired grouped GGUF MMQ requires one quantization type."
-            )
-        if first_weight.logical_shape != second_weight.logical_shape:
-            raise RuntimeError(
-                "Paired grouped GGUF MMQ requires matching logical shapes."
-            )
-
-        input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(compute_dtype).contiguous()
-        expert_indices = expert_indices.to(
-            device=hidden_states.device, dtype=torch.long
-        ).contiguous()
-        expert_offsets = expert_offsets.to(
-            device=hidden_states.device, dtype=torch.int32
-        ).contiguous()
-        group_sizes = group_sizes.to(
-            device=hidden_states.device, dtype=torch.int32
-        ).contiguous()
-        first_payload = first_weight.as_subclass(torch.Tensor)
-        second_payload = second_weight.as_subclass(torch.Tensor)
-
-        ctx.compute_dtype = compute_dtype
-        ctx.input_dtype = input_dtype
-        ctx.quant_type = first_weight.quant_type
-        ctx.in_features = int(first_weight.logical_shape[-1])
-        if ctx.needs_input_grad[0]:
-            ctx.save_for_backward(
-                first_payload,
-                second_payload,
-                expert_indices,
-                expert_offsets,
-            )
-
-        return grouped_mmq_pair(
-            hidden_states,
-            first_payload,
-            second_payload,
-            expert_indices,
-            expert_offsets,
-            int(first_weight.quant_type),
-            int(first_weight.logical_shape[-2]),
-        )
-
-    @staticmethod
-    def backward(  # ty: ignore[invalid-method-override]
-        ctx,
-        first_grad_output: torch.Tensor | None,
-        second_grad_output: torch.Tensor | None,
-    ):
-        grad_hidden = None
-        if ctx.needs_input_grad[0]:
-            (
-                first_payload,
-                second_payload,
-                expert_indices,
-                expert_offsets,
-            ) = ctx.saved_tensors
-            if first_grad_output is not None and second_grad_output is not None:
-                grad_hidden = (
-                    torch.ops.torch_ggml_ops.grouped_mmq_pair_grad_input.default(
-                        first_grad_output.contiguous(),
-                        second_grad_output.contiguous(),
-                        first_payload,
-                        second_payload,
-                        expert_indices,
-                        expert_offsets,
-                        int(ctx.quant_type),
-                        ctx.in_features,
-                    )
-                )
-            elif first_grad_output is not None:
-                grad_hidden = torch.ops.torch_ggml_ops.grouped_mmq_grad_input.default(
-                    first_grad_output.contiguous(),
-                    first_payload,
-                    expert_indices,
-                    expert_offsets,
-                    int(ctx.quant_type),
-                    ctx.in_features,
-                )
-            elif second_grad_output is not None:
-                grad_hidden = torch.ops.torch_ggml_ops.grouped_mmq_grad_input.default(
-                    second_grad_output.contiguous(),
-                    second_payload,
-                    expert_indices,
-                    expert_offsets,
-                    int(ctx.quant_type),
-                    ctx.in_features,
-                )
-            if grad_hidden is not None:
-                grad_hidden = grad_hidden.to(ctx.input_dtype)
-        return grad_hidden, None, None, None, None, None, None
+    expert_offsets: torch.Tensor,
+    compute_dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if compute_dtype != torch.bfloat16:
+        raise RuntimeError("Grouped GGUF MMQ requires BF16 compute dtype.")
+    hidden_states = hidden_states.to(compute_dtype).contiguous()
+    expert_indices = expert_indices.to(
+        device=hidden_states.device, dtype=torch.long
+    ).contiguous()
+    expert_offsets = expert_offsets.to(
+        device=hidden_states.device, dtype=torch.int32
+    ).contiguous()
+    return hidden_states, expert_indices, expert_offsets
 
 
 def _base_grouped_linear(
@@ -404,13 +173,28 @@ def _base_grouped_linear(
     group_sizes: torch.Tensor,
     compute_dtype: torch.dtype,
 ) -> torch.Tensor:
-    return _AiterGGUFExpertProjection.apply(
+    del group_sizes
+    if not isinstance(weight, GGUFQuantizedTensor):
+        raise TypeError(
+            "Fast MoE base projections require packed GGUF weights and the "
+            "exported torch_ggml_ops grouped_mmq API."
+        )
+    if weight.requires_grad:
+        raise RuntimeError(
+            "Fast GGUF expert execution requires frozen packed base weights."
+        )
+    hidden_states, expert_indices, expert_offsets = _native_grouped_arguments(
+        hidden_states, expert_indices, expert_offsets, compute_dtype
+    )
+    quant_type = int(cast(Any, weight.quant_type))
+    logical_shape = cast(tuple[int, ...], weight.logical_shape)
+    return grouped_mmq(
         hidden_states,
-        weight,
+        weight.as_subclass(torch.Tensor),
         expert_indices,
         expert_offsets,
-        group_sizes,
-        compute_dtype,
+        quant_type,
+        int(logical_shape[-2]),
     )
 
 
@@ -423,22 +207,31 @@ def _base_grouped_pair(
     group_sizes: torch.Tensor,
     compute_dtype: torch.dtype,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if not isinstance(first_weight, GGUFQuantizedTensor) or not isinstance(
+        second_weight, GGUFQuantizedTensor
+    ):
+        raise TypeError("Fast MoE paired base projections require packed GGUF weights.")
     if (
-        isinstance(first_weight, GGUFQuantizedTensor)
-        and isinstance(second_weight, GGUFQuantizedTensor)
-        and supports_native_mmq(first_weight)
-        and supports_native_mmq(second_weight)
-        and first_weight.quant_type == second_weight.quant_type
+        first_weight.quant_type == second_weight.quant_type
         and first_weight.logical_shape == second_weight.logical_shape
     ):
-        return _AiterGGUFExpertPairProjection.apply(
+        if first_weight.requires_grad or second_weight.requires_grad:
+            raise RuntimeError(
+                "Fast GGUF expert execution requires frozen packed base weights."
+            )
+        hidden_states, expert_indices, expert_offsets = _native_grouped_arguments(
+            hidden_states, expert_indices, expert_offsets, compute_dtype
+        )
+        quant_type = int(cast(Any, first_weight.quant_type))
+        logical_shape = cast(tuple[int, ...], first_weight.logical_shape)
+        return grouped_mmq_pair(
             hidden_states,
-            first_weight,
-            second_weight,
+            first_weight.as_subclass(torch.Tensor),
+            second_weight.as_subclass(torch.Tensor),
             expert_indices,
             expert_offsets,
-            group_sizes,
-            compute_dtype,
+            quant_type,
+            int(logical_shape[-2]),
         )
     return (
         _base_grouped_linear(
