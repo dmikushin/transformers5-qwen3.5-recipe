@@ -46,6 +46,25 @@ class _RouterModel(torch.nn.Module):
         self.router = router
 
 
+class _MoeLayer(torch.nn.Module):
+    def __init__(self, router: torch.nn.Module) -> None:
+        super().__init__()
+        self.gate = router
+        self.experts = torch.nn.Module()
+
+
+class _MoeModel(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.config = SimpleNamespace(model_type="test", scoring_func="sqrtsoftplus")
+        self.layers = torch.nn.ModuleList(
+            [
+                _MoeLayer(DeepseekV4HashRouter(cast(Any, _deepseek_config()))),
+                _MoeLayer(DeepseekV4TopKRouter(cast(Any, _deepseek_config()))),
+            ]
+        )
+
+
 def _sort_routes(
     weights: torch.Tensor, indices: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -92,6 +111,18 @@ def test_unknown_router_geometry_is_rejected() -> None:
     logits = torch.randn(8, 128, device="cuda", dtype=torch.float32)
     with pytest.raises(RuntimeError, match="supports only 256-expert"):
         router_topk_indices(logits, 4)
+
+
+def test_router_configuration_binds_prior_to_owning_experts() -> None:
+    model = _MoeModel()
+    result = configure_fast_moe_ranking(model)
+
+    assert result["deepseek_hash"] == 1
+    assert result["deepseek_topk"] == 1
+    first_experts = cast(torch.nn.Module, model.layers[0].experts)
+    second_experts = cast(torch.nn.Module, model.layers[1].experts)
+    assert first_experts.__dict__["_aiter_expert_prior"] == "deepseek-hash"
+    assert second_experts.__dict__["_aiter_expert_prior"] == "deepseek-learned"
 
 
 def test_qwen_router_matches_reference_forward_and_gradient() -> None:

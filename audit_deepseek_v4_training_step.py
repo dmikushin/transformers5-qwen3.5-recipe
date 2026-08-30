@@ -88,20 +88,14 @@ def parse_args() -> argparse.Namespace:
 
 def process_memory() -> dict[str, int]:
     values: dict[str, int] = {}
-    try:
-        for line in Path("/proc/self/smaps_rollup").read_text().splitlines():
-            key, _, rest = line.partition(":")
-            if key in {"Rss", "Pss_File", "Private_Clean", "Private_Dirty", "Swap"}:
-                values[f"process_{key.lower()}_bytes"] = int(rest.split()[0]) * 1024
-    except OSError:
-        pass
-    try:
-        for line in Path("/proc/meminfo").read_text().splitlines():
-            key, _, rest = line.partition(":")
-            if key in {"SwapTotal", "SwapFree"}:
-                values[f"system_{key.lower()}_bytes"] = int(rest.split()[0]) * 1024
-    except OSError:
-        pass
+    for line in Path("/proc/self/smaps_rollup").read_text().splitlines():
+        key, _, rest = line.partition(":")
+        if key in {"Rss", "Pss_File", "Private_Clean", "Private_Dirty", "Swap"}:
+            values[f"process_{key.lower()}_bytes"] = int(rest.split()[0]) * 1024
+    for line in Path("/proc/meminfo").read_text().splitlines():
+        key, _, rest = line.partition(":")
+        if key in {"SwapTotal", "SwapFree"}:
+            values[f"system_{key.lower()}_bytes"] = int(rest.split()[0]) * 1024
     return values
 
 
@@ -573,7 +567,9 @@ def main() -> None:
 
         def inject_adapters():
             register_deepseek_v4_lora(lora_config)
-            register_deepseek_v4_moe_lora(lora_config, model)
+            register_deepseek_v4_moe_lora(
+                lora_config, model, expert_prior="deepseek-learned"
+            )
             wrapped = get_peft_model(model, lora_config, autocast_adapter_dtype=False)
             apply_deepseek_v4_liger_loss(wrapped)
             return wrapped
@@ -836,15 +832,6 @@ def main() -> None:
         report["memory_final"] = memory_snapshot()
         persist()
         print(f"DEEPSEEK V4 GATE PASS: {args.report_output}", flush=True)
-    except BaseException as error:
-        report["status"] = "failed"
-        report["error"] = {"type": type(error).__name__, "message": str(error)}
-        try:
-            report["memory_at_failure"] = memory_snapshot()
-        except Exception as memory_error:  # noqa: BLE001 - preserve original failure
-            report["memory_at_failure_error"] = str(memory_error)
-        persist()
-        raise
     finally:
         collector.remove()
 

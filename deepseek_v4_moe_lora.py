@@ -18,6 +18,52 @@ EXPERTS_IMPLEMENTATION = "deepseek_v4_gguf_mmq_aiter_lora"
 _LORA_WEIGHTS_KWARG = "_deepseek_v4_gguf_lora_weights"
 
 
+def _bind_deepseek_expert_priors(
+    model: torch.nn.Module,
+    fallback_prior: str,
+) -> dict[str, int]:
+    """Bind the route-law prior to each DeepSeek routed-expert module."""
+
+    get_base_model = getattr(model, "get_base_model", None)
+    base = get_base_model() if callable(get_base_model) else model
+    counts = {"deepseek-learned": 0, "deepseek-hash": 0}
+
+    for name, module in base.named_modules():
+        if not isinstance(module, DeepseekV4GGUFExperts):
+            continue
+        prior = module.__dict__.get("_aiter_expert_prior", fallback_prior)
+        block_name, separator, suffix = name.rpartition(".experts")
+        if separator and not suffix:
+            block = base.get_submodule(block_name)
+            is_hash = getattr(block, "is_hash", None)
+            if isinstance(is_hash, bool):
+                prior = "deepseek-hash" if is_hash else "deepseek-learned"
+            else:
+                gate = getattr(block, "gate", None)
+                gate_name = type(gate).__name__
+                if gate_name == "DeepseekV4HashRouter":
+                    prior = "deepseek-hash"
+                elif gate_name == "DeepseekV4TopKRouter":
+                    prior = "deepseek-learned"
+        if prior not in counts:
+            raise ValueError(
+                f"DeepSeek expert module {name!r} has unsupported prior {prior!r}."
+            )
+        module.__dict__["_aiter_expert_prior"] = prior
+        counts[prior] += 1
+
+    model_type = getattr(getattr(base, "config", None), "model_type", None)
+    if model_type == "deepseek_v4" and counts != {
+        "deepseek-learned": 40,
+        "deepseek-hash": 3,
+    }:
+        raise RuntimeError(
+            "expected 40 learned and 3 hash DeepSeek expert modules, found "
+            f"{counts['deepseek-learned']} and {counts['deepseek-hash']}"
+        )
+    return counts
+
+
 class DeepseekV4GGUFMoeLora(FastGGUFMoeLora):
     """PEFT wrapper for all gate, up, and down transforms of one MoE layer."""
 
@@ -64,10 +110,18 @@ def deepseek_v4_gguf_mmq_aiter_lora_forward(
 
 
 def register_deepseek_v4_moe_lora(
-    lora_config: LoraConfig, model: torch.nn.Module
+    lora_config: LoraConfig,
+    model: torch.nn.Module,
+    *,
+    expert_prior: str,
 ) -> LoraConfig:
-    """Register the DeepSeek expert backend and its config-local PEFT wrapper."""
+    """Register the DeepSeek backend and bind a prior per routed layer."""
 
+    if expert_prior not in {"deepseek-learned", "deepseek-hash"}:
+        raise ValueError(
+            "DeepSeek expert registration requires prior='deepseek-learned' or "
+            "prior='deepseek-hash'."
+        )
     register = getattr(lora_config, "_register_custom_module", None)
     if register is None:
         raise RuntimeError(
@@ -90,5 +144,8 @@ def register_deepseek_v4_moe_lora(
         deepseek_v4_gguf_mmq_aiter_lora_forward
     )
     cast(Any, model).set_experts_implementation(EXPERTS_IMPLEMENTATION)
+    lora_config.__dict__["_aiter_expert_prior_counts"] = _bind_deepseek_expert_priors(
+        model, expert_prior
+    )
     register({DeepseekV4GGUFExperts: DeepseekV4GGUFMoeLora})
     return lora_config

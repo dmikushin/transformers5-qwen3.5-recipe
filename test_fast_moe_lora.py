@@ -64,8 +64,8 @@ def synthetic_aiter_configs(monkeypatch) -> None:
         "num_warps": 4,
         "num_stages": 1,
     }
-    monkeypatch.setattr(fast_moe_lora, "_gmm_config", lambda *_: dict(config))
-    monkeypatch.setattr(fast_moe_lora, "_ptgmm_config", lambda *_: dict(config))
+    monkeypatch.setattr(fast_moe_lora, "_gmm_config", lambda *_, **__: dict(config))
+    monkeypatch.setattr(fast_moe_lora, "_ptgmm_config", lambda *_, **__: dict(config))
 
 
 @pytest.fixture(scope="module")
@@ -240,7 +240,10 @@ def test_packed_expert_projection_backward_is_exact_logical_jacobian(
         device="cuda",
     )
     expected_intermediate_grad = _aiter_input_grad(
-        down_grad, logical_down.transpose(1, 2), group_sizes
+        down_grad,
+        logical_down.transpose(1, 2),
+        group_sizes,
+        expert_prior="qwen-learned",
     )
     torch.testing.assert_close(
         _require_grad(intermediate), expected_intermediate_grad, rtol=0, atol=0
@@ -282,11 +285,17 @@ def test_full_group_lora_eliminates_selection_and_zeros_inactive_gradients() -> 
 
     dispatched_ops: list[str] = []
     with _RecordOps(dispatched_ops):
-        output = aiter_grouped_mm(lhs, factor.transpose(1, 2), full_sizes)
+        output = aiter_grouped_mm(
+            lhs,
+            factor.transpose(1, 2),
+            full_sizes,
+            expert_prior="qwen-learned",
+        )
     reference = aiter_grouped_mm(
         reference_lhs,
         reference_factor.index_select(0, active_experts).transpose(1, 2),
         active_sizes,
+        expert_prior="qwen-learned",
     )
     gradients = torch.autograd.grad(output, (lhs, factor), grad_output)
     reference_gradients = torch.autograd.grad(
@@ -304,7 +313,12 @@ def test_full_group_lora_eliminates_selection_and_zeros_inactive_gradients() -> 
     checkpoint_lhs = lhs.detach().clone().requires_grad_()
     checkpoint_factor = factor.detach().clone().requires_grad_()
     checkpoint_output = checkpoint(
-        lambda left, right: aiter_grouped_mm(left, right.transpose(1, 2), full_sizes),
+        lambda left, right: aiter_grouped_mm(
+            left,
+            right.transpose(1, 2),
+            full_sizes,
+            expert_prior="qwen-learned",
+        ),
         checkpoint_lhs,
         checkpoint_factor,
         use_reentrant=False,
@@ -321,12 +335,12 @@ def test_aiter_config_dispatch_uses_rows_and_factor_layout(monkeypatch) -> None:
     gmm_keys = []
     ptgmm_keys = []
 
-    def record_gmm_config(m, k, n, transposed_rhs):
-        gmm_keys.append((m, k, n, transposed_rhs))
+    def record_gmm_config(m, k, n, transposed_rhs, expert_prior):
+        gmm_keys.append((m, k, n, transposed_rhs, expert_prior))
         return {}
 
-    def record_ptgmm_config(m, k, n):
-        ptgmm_keys.append((m, k, n))
+    def record_ptgmm_config(m, k, n, expert_prior):
+        ptgmm_keys.append((m, k, n, expert_prior))
         return {}
 
     def fake_gmm(lhs, rhs, group_sizes, **kwargs):
@@ -345,12 +359,19 @@ def test_aiter_config_dispatch_uses_rows_and_factor_layout(monkeypatch) -> None:
     factor = torch.empty(3, 3, 8).transpose(1, 2)
     grad_output = torch.empty(6, 3)
     group_sizes = torch.tensor([2, 2, 2], dtype=torch.int32)
-    fast_moe_lora._aiter_forward(lhs, factor, group_sizes)
-    fast_moe_lora._aiter_input_grad(grad_output, factor, group_sizes)
-    fast_moe_lora._aiter_weight_grad(lhs, grad_output, group_sizes)
+    fast_moe_lora._aiter_forward(lhs, factor, group_sizes, expert_prior="qwen-learned")
+    fast_moe_lora._aiter_input_grad(
+        grad_output, factor, group_sizes, expert_prior="qwen-learned"
+    )
+    fast_moe_lora._aiter_weight_grad(
+        lhs, grad_output, group_sizes, expert_prior="qwen-learned"
+    )
 
-    assert gmm_keys == [(6, 8, 3, True), (6, 3, 8, False)]
-    assert ptgmm_keys == [(6, 8, 3)]
+    assert gmm_keys == [
+        (6, 8, 3, True, "qwen-learned"),
+        (6, 3, 8, False, "qwen-learned"),
+    ]
+    assert ptgmm_keys == [(6, 8, 3, "qwen-learned")]
 
 
 def test_aiter_grouped_mm_rejects_layout_repairs() -> None:
@@ -358,13 +379,23 @@ def test_aiter_grouped_mm_rejects_layout_repairs() -> None:
     factor = torch.randn(3, 4, 16, device="cuda", dtype=torch.bfloat16)
     group_sizes = torch.tensor([2, 2, 2], device="cuda", dtype=torch.int32)
     with pytest.raises(ValueError, match="lhs must be row-major"):
-        aiter_grouped_mm(lhs, factor.transpose(1, 2), group_sizes)
+        aiter_grouped_mm(
+            lhs,
+            factor.transpose(1, 2),
+            group_sizes,
+            expert_prior="qwen-learned",
+        )
 
     valid_lhs = torch.randn(
         6, 16, device="cuda", dtype=torch.bfloat16, requires_grad=True
     )
     valid_factor = factor.detach().requires_grad_()
-    output = aiter_grouped_mm(valid_lhs, valid_factor.transpose(1, 2), group_sizes)
+    output = aiter_grouped_mm(
+        valid_lhs,
+        valid_factor.transpose(1, 2),
+        group_sizes,
+        expert_prior="qwen-learned",
+    )
     strided_gradient = torch.randn(
         output.shape[1], output.shape[0], device="cuda", dtype=torch.bfloat16
     ).T
@@ -404,6 +435,7 @@ def test_one_expert_layer_has_finite_lora_gradients_and_no_packed_gradients(
         lora_dropout=0.0,
         bias="none",
     )
+    experts.__dict__["_aiter_expert_prior"] = "qwen-learned"
     layer = FastGGUFMoeLora(
         experts,
         "default",

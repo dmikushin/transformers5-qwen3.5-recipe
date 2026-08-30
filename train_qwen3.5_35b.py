@@ -102,7 +102,7 @@ def main():
         use_rslora=False,
     )
     register_fast_lora(lora_config)
-    register_fast_moe_lora(lora_config, model)
+    register_fast_moe_lora(lora_config, model, expert_prior="qwen-learned")
     model = get_peft_model(model, lora_config, autocast_adapter_dtype=False)
 
     apply_gguf_liger_fused_linear_cross_entropy(model)

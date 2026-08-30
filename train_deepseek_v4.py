@@ -95,7 +95,7 @@ def main():
         use_rslora=False,
     )
     register_deepseek_v4_lora(lora_config)
-    register_deepseek_v4_moe_lora(lora_config, model)
+    register_deepseek_v4_moe_lora(lora_config, model, expert_prior="deepseek-learned")
     model = get_peft_model(model, lora_config, autocast_adapter_dtype=False)
 
     apply_deepseek_v4_liger_loss(model)

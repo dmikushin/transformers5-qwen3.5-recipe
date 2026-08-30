@@ -36,7 +36,11 @@ _GGUF_EXPERTS_TYPE = cast(type[Any], GGUFExperts)
 
 
 def _aiter_forward(
-    lhs: torch.Tensor, rhs: torch.Tensor, group_sizes: torch.Tensor
+    lhs: torch.Tensor,
+    rhs: torch.Tensor,
+    group_sizes: torch.Tensor,
+    *,
+    expert_prior: str,
 ) -> torch.Tensor:
     return gmm(
         lhs,
@@ -44,7 +48,11 @@ def _aiter_forward(
         group_sizes,
         preferred_element_type=lhs.dtype,
         config=_gmm_config(
-            lhs.shape[0], lhs.shape[1], rhs.shape[-1], rhs.stride(1) == 1
+            lhs.shape[0],
+            lhs.shape[1],
+            rhs.shape[-1],
+            rhs.stride(1) == 1,
+            expert_prior=expert_prior,
         ),
     )
 
@@ -53,6 +61,8 @@ def _aiter_input_grad(
     grad_output: torch.Tensor,
     rhs: torch.Tensor,
     group_sizes: torch.Tensor,
+    *,
+    expert_prior: str,
 ) -> torch.Tensor:
     input_rhs = rhs.transpose(1, 2)
     return gmm(
@@ -65,6 +75,7 @@ def _aiter_input_grad(
             grad_output.shape[1],
             input_rhs.shape[-1],
             input_rhs.stride(1) == 1,
+            expert_prior=expert_prior,
         ),
     )
 
@@ -73,13 +84,20 @@ def _aiter_weight_grad(
     lhs: torch.Tensor,
     grad_output: torch.Tensor,
     group_sizes: torch.Tensor,
+    *,
+    expert_prior: str,
 ) -> torch.Tensor:
     return ptgmm(
         lhs.T,
         grad_output,
         group_sizes,
         preferred_element_type=lhs.dtype,
-        config=_ptgmm_config(lhs.shape[0], lhs.shape[1], grad_output.shape[1]),
+        config=_ptgmm_config(
+            lhs.shape[0],
+            lhs.shape[1],
+            grad_output.shape[1],
+            expert_prior=expert_prior,
+        ),
     )
 
 
@@ -92,6 +110,7 @@ class _AiterGroupedMM(torch.autograd.Function):
         lhs: torch.Tensor,
         rhs: torch.Tensor,
         group_sizes: torch.Tensor,
+        expert_prior: str,
     ) -> torch.Tensor:
         if lhs.ndim != 2 or rhs.ndim != 3 or group_sizes.ndim != 1:
             raise ValueError(
@@ -116,8 +135,9 @@ class _AiterGroupedMM(torch.autograd.Function):
             raise ValueError("AITER grouped MM group_sizes must share the lhs device.")
         if group_sizes.dtype != torch.int32 or group_sizes.stride() != (1,):
             raise ValueError("AITER grouped MM group_sizes must be contiguous int32.")
+        ctx.expert_prior = expert_prior
         ctx.save_for_backward(lhs, rhs, group_sizes)
-        return _aiter_forward(lhs, rhs, group_sizes)
+        return _aiter_forward(lhs, rhs, group_sizes, expert_prior=ctx.expert_prior)
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):  # ty: ignore[invalid-method-override]
@@ -125,26 +145,35 @@ class _AiterGroupedMM(torch.autograd.Function):
         if grad_output.stride() != (grad_output.shape[1], 1):
             raise ValueError("AITER grouped MM output gradient must be row-major.")
         grad_lhs = (
-            _aiter_input_grad(grad_output, rhs, group_sizes)
+            _aiter_input_grad(
+                grad_output, rhs, group_sizes, expert_prior=ctx.expert_prior
+            )
             if ctx.needs_input_grad[0]
             else None
         )
         grad_rhs = (
-            _aiter_weight_grad(lhs, grad_output, group_sizes)
+            _aiter_weight_grad(
+                lhs,
+                grad_output,
+                group_sizes,
+                expert_prior=ctx.expert_prior,
+            )
             if ctx.needs_input_grad[1]
             else None
         )
-        return grad_lhs, grad_rhs, None
+        return grad_lhs, grad_rhs, None, None
 
 
 def aiter_grouped_mm(
     lhs: torch.Tensor,
     rhs: torch.Tensor,
     group_sizes: torch.Tensor,
+    *,
+    expert_prior: str,
 ) -> torch.Tensor:
     """Apply the autograd-capable AITER grouped matrix multiplication."""
 
-    return _AiterGroupedMM.apply(lhs, rhs, group_sizes)
+    return _AiterGroupedMM.apply(lhs, rhs, group_sizes, expert_prior)
 
 
 def _native_grouped_arguments(
@@ -270,6 +299,7 @@ class _ExpertLoraWeights:
     down_a: torch.Tensor  # [experts, rank, intermediate]
     down_b: torch.Tensor  # [experts, hidden, rank]
     scaling: float
+    expert_prior: str
 
 
 class FastGGUFMoeLora(torch.nn.Module, LoraLayer):
@@ -301,6 +331,13 @@ class FastGGUFMoeLora(torch.nn.Module, LoraLayer):
         LoraLayer.__init__(
             self, base_layer, ephemeral_gpu_offload=ephemeral_gpu_offload, **kwargs
         )
+        experts = self.get_base_layer()
+        expert_prior = experts.__dict__.get("_aiter_expert_prior")
+        if not isinstance(expert_prior, str):
+            raise TypeError(
+                "Fast GGUF MoE LoRA requires a prior bound to its expert module."
+            )
+        self._expert_prior = expert_prior
         self.lora_A_down = torch.nn.ModuleDict()
         self.lora_B_down = torch.nn.ModuleDict()
         self._active_adapter = adapter_name
@@ -422,6 +459,7 @@ class FastGGUFMoeLora(torch.nn.Module, LoraLayer):
             down_a=lora_a_down.weight,
             down_b=lora_b_down.weight,
             scaling=float(self.scaling[adapter_name]),
+            expert_prior=self._expert_prior,
         )
 
     def forward(
@@ -470,9 +508,21 @@ def _lora_grouped_linear(
     lora_a: torch.Tensor,
     lora_b: torch.Tensor,
     group_sizes: torch.Tensor,
+    *,
+    expert_prior: str,
 ) -> torch.Tensor:
-    rank_states = aiter_grouped_mm(hidden_states, lora_a.transpose(1, 2), group_sizes)
-    return aiter_grouped_mm(rank_states, lora_b.transpose(1, 2), group_sizes)
+    rank_states = aiter_grouped_mm(
+        hidden_states,
+        lora_a.transpose(1, 2),
+        group_sizes,
+        expert_prior=expert_prior,
+    )
+    return aiter_grouped_mm(
+        rank_states,
+        lora_b.transpose(1, 2),
+        group_sizes,
+        expert_prior=expert_prior,
+    )
 
 
 def qwen3_5_moe_gguf_mmq_aiter_lora_forward(
@@ -532,6 +582,7 @@ def qwen3_5_moe_gguf_mmq_aiter_lora_forward(
             lora_weights.gate_up_a,
             lora_weights.gate_up_b,
             lora_group_sizes,
+            expert_prior=lora_weights.expert_prior,
         )
         gate_delta, up_delta = gate_up_delta.chunk(2, dim=-1)
         gate = torch.add(gate, gate_delta, alpha=lora_weights.scaling)
@@ -552,6 +603,7 @@ def qwen3_5_moe_gguf_mmq_aiter_lora_forward(
             lora_weights.down_a,
             lora_weights.down_b,
             lora_group_sizes,
+            expert_prior=lora_weights.expert_prior,
         )
         output = torch.add(output, down_delta, alpha=lora_weights.scaling)
 
@@ -564,10 +616,15 @@ def qwen3_5_moe_gguf_mmq_aiter_lora_forward(
 
 
 def register_fast_moe_lora(
-    lora_config: LoraConfig, model: torch.nn.Module
+    lora_config: LoraConfig,
+    model: torch.nn.Module,
+    *,
+    expert_prior: str,
 ) -> LoraConfig:
-    """Register the process-wide GGUF backend and its config-local PEFT wrapper."""
+    """Register the GGUF backend and bind its routed expert prior."""
 
+    if expert_prior != "qwen-learned":
+        raise ValueError("Qwen expert registration requires prior='qwen-learned'.")
     register = getattr(lora_config, "_register_custom_module", None)
     if register is None:
         raise RuntimeError(
@@ -591,5 +648,8 @@ def register_fast_moe_lora(
         qwen3_5_moe_gguf_mmq_aiter_lora_forward
     )
     cast(Any, model).set_experts_implementation(EXPERTS_IMPLEMENTATION)
+    for module in model.modules():
+        if isinstance(module, _GGUF_EXPERTS_TYPE):
+            module.__dict__["_aiter_expert_prior"] = expert_prior
     register({GGUFExperts: FastGGUFMoeLora})
     return lora_config

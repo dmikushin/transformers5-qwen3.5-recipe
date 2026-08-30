@@ -215,7 +215,9 @@ DeepSeek checkpoint-charged routed-LoRA complete medians are:
 
 The retained implementation always passes all 256 expert factor planes and uses a contiguous 256-entry `int32` group-size vector with zero sizes for inactive experts. Packed frozen MMQ remains compact-active. There are no factor `index_select` allocations, factor-scatter autograd paths, implicit contiguous repairs, or square-matrix workarounds.
 
-`moe_gmm_configs.py` owns exactly 66 GMM keys `(M,K,N,RHS-layout)` and 33 PTGMM keys `(M,K,N)` for the required DeepSeek/Qwen B1/B4/B16 shapes. Layout is part of GMM identity. Unsupported shapes fail closed because the measured table does not support a reliable general heuristic. The coefficient-only priors, bounded per-key search, and confirmation evidence are recorded in [aiter_gmm_ptgmm_coefficient_prior_tuning.md](aiter_gmm_ptgmm_coefficient_prior_tuning.md).
+`moe_gmm_configs.py` owns prior-keyed entries for the required DeepSeek/Qwen B1/B4/B16 shapes: 96 GMM keys `(prior,M,K,N,RHS-layout)` and 48 PTGMM keys `(prior,M,K,N)`. DeepSeek learned and DeepSeek hash entries are separate route-law tables. Qwen entries use the Qwen learned prior. Layout is part of GMM identity. Unsupported shapes fail closed because the measured table does not support a reliable general heuristic. The coefficient-only priors, bounded per-key search, and confirmation evidence are recorded in `aiter_gmm_ptgmm_coefficient_prior_tuning.md`.
+
+DeepSeek V4 has mixed routed-layer topology: `model.layers[0].mlp` through `model.layers[2].mlp` use `DeepseekV4HashRouter` and therefore bind `deepseek-hash`. `model.layers[3].mlp` through `model.layers[42].mlp` use `DeepseekV4TopKRouter` and bind `deepseek-learned`. The binding is stored on each `.mlp.experts` module before PEFT creates its wrapper, so the prior follows the router that produced the route bank. The router linear itself and each `.mlp.shared_experts` dense MLP do not consume the routed GMM/PTGMM table. The current GGUF production path uses packed MMQ for frozen base projections and their input gradients. The base-shaped GMM/PTGMM entries remain explicit, measured baselines for an alternate non-packed base backend.
 
 Outputs, hidden gradients, active factor gradients, inactive zero gradients, sparse routes, and non-reentrant checkpoint replay are bitwise equal to the compact correctness control.
 
@@ -336,6 +338,7 @@ Rejected or deferred:
 
 - Ordinary LoRA uses the existing hipBLASLt BF16 path and fused LoRA-B plus residual addition where applicable.
 - Routed LoRA uses one unconditional full-256-group implementation.
+- Each routed wrapper captures the prior bound to its owning expert module: the first three wrappers use `deepseek-hash`, and the remaining forty use `deepseek-learned`.
 - Original expert factor planes are passed through supported transpose metadata views.
 - AITER `gmm` computes forward and input gradients. `ptgmm` writes complete expert-major factor gradients directly.
 - Exact target dispatch includes row count and RHS layout and rejects unmeasured shapes.

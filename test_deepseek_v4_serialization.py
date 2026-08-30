@@ -56,8 +56,9 @@ class _ToyDeepseek(torch.nn.Module):
         self.experts.config._experts_implementation = implementation
 
 
-def _wrapped_toy() -> torch.nn.Module:
+def _wrapped_toy(expert_prior: str = "deepseek-learned") -> torch.nn.Module:
     model = _ToyDeepseek()
+    model.experts.__dict__["_aiter_expert_prior"] = expert_prior
     config = LoraConfig(
         target_modules=DEEPSEEK_V4_TARGET_MODULES_PATTERN,
         r=4,
@@ -66,8 +67,18 @@ def _wrapped_toy() -> torch.nn.Module:
         bias="none",
     )
     register_deepseek_v4_lora(config)
-    register_deepseek_v4_moe_lora(config, model)
+    register_deepseek_v4_moe_lora(config, model, expert_prior="deepseek-learned")
     return get_peft_model(model, config, autocast_adapter_dtype=False)
+
+
+def test_module_prior_overrides_registration_fallback() -> None:
+    wrapped = _wrapped_toy("deepseek-hash")
+    expert_wrapper = next(
+        module
+        for module in wrapped.modules()
+        if isinstance(module, DeepseekV4GGUFMoeLora)
+    )
+    assert expert_wrapper._expert_prior == "deepseek-hash"
 
 
 def test_adapter_state_round_trip_contains_only_all_six_lora_factors() -> None:

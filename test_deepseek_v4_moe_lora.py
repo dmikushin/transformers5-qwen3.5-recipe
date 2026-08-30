@@ -1,6 +1,7 @@
 import os
 from pathlib import Path
 from types import SimpleNamespace
+from typing import cast
 
 import gguf
 import numpy as np
@@ -21,6 +22,7 @@ import fast_moe_lora
 from deepseek_v4_moe_lora import (
     EXPERTS_IMPLEMENTATION,
     DeepseekV4GGUFMoeLora,
+    _bind_deepseek_expert_priors,
     deepseek_v4_gguf_mmq_aiter_lora_forward,
 )
 from fast_moe_lora import (
@@ -41,8 +43,8 @@ def synthetic_aiter_configs(monkeypatch) -> None:
         "num_warps": 4,
         "num_stages": 1,
     }
-    monkeypatch.setattr(fast_moe_lora, "_gmm_config", lambda *_: dict(config))
-    monkeypatch.setattr(fast_moe_lora, "_ptgmm_config", lambda *_: dict(config))
+    monkeypatch.setattr(fast_moe_lora, "_gmm_config", lambda *_, **__: dict(config))
+    monkeypatch.setattr(fast_moe_lora, "_ptgmm_config", lambda *_, **__: dict(config))
 
 
 class _RecordOps(TorchDispatchMode):
@@ -61,6 +63,45 @@ _MODEL = Path(
         os.path.expanduser("~/models/ds4/DeepSeek-V4-Flash-IQ2XXS.gguf"),
     )
 )
+
+
+class _BindingToyBlock(torch.nn.Module):
+    def __init__(self, is_hash: bool) -> None:
+        super().__init__()
+        self.is_hash = is_hash
+        config = SimpleNamespace(
+            num_experts=2,
+            hidden_size=2,
+            moe_intermediate_size=2,
+            hidden_act="silu",
+            swiglu_limit=1.0,
+            _experts_implementation="eager",
+        )
+        self.experts = DeepseekV4GGUFExperts(
+            config,
+            device="cpu",
+            compute_dtype=torch.bfloat16,
+        )
+        self.experts.config = config
+
+
+class _BindingToyModel(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.layers = torch.nn.ModuleList(
+            [_BindingToyBlock(is_hash=True), _BindingToyBlock(is_hash=False)]
+        )
+
+
+def test_deepseek_prior_binding_follows_each_moe_router() -> None:
+    model = _BindingToyModel()
+    counts = _bind_deepseek_expert_priors(model, "deepseek-learned")
+
+    assert counts == {"deepseek-learned": 1, "deepseek-hash": 1}
+    first_experts = cast(torch.nn.Module, model.layers[0].experts)
+    second_experts = cast(torch.nn.Module, model.layers[1].experts)
+    assert first_experts.__dict__["_aiter_expert_prior"] == "deepseek-hash"
+    assert second_experts.__dict__["_aiter_expert_prior"] == "deepseek-learned"
 
 
 @pytest.fixture(scope="module")
@@ -236,6 +277,7 @@ def test_complete_deepseek_expert_lora_preserves_clamp_and_has_finite_gradients(
         lora_dropout=0.0,
         bias="none",
     )
+    experts.__dict__["_aiter_expert_prior"] = "deepseek-learned"
     layer = DeepseekV4GGUFMoeLora(
         experts,
         "default",

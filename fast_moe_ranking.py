@@ -316,6 +316,22 @@ def _deepseek_hash_router_forward(
     return logits, weights * self.routed_scaling_factor, indices
 
 
+def _bind_router_expert_prior(
+    base: torch.nn.Module,
+    router_name: str,
+    expert_prior: str,
+) -> bool:
+    block_name, separator, suffix = router_name.rpartition(".gate")
+    if not separator or suffix:
+        return False
+    block = base.get_submodule(block_name)
+    experts = getattr(block, "experts", None)
+    if experts is None:
+        return False
+    experts.__dict__["_aiter_expert_prior"] = expert_prior
+    return True
+
+
 def configure_fast_moe_ranking(model: torch.nn.Module) -> dict[str, Any]:
     """Install the fixed-shape Qwen or DeepSeek routing-gate implementation."""
 
@@ -336,6 +352,7 @@ def configure_fast_moe_ranking(model: torch.nn.Module) -> dict[str, Any]:
                     f"Qwen router {name!r} does not match 2048/256/top-8."
                 )
             module.forward = MethodType(_qwen_router_forward, module)
+            _bind_router_expert_prior(base, name, "qwen-learned")
             paths["qwen"].append(name)
         elif isinstance(module, DeepseekV4TopKRouter):
             if (
@@ -348,6 +365,7 @@ def configure_fast_moe_ranking(model: torch.nn.Module) -> dict[str, Any]:
                     f"DeepSeek router {name!r} does not match 4096/256/top-6 sqrtsoftplus."
                 )
             module.forward = MethodType(_deepseek_topk_router_forward, module)
+            _bind_router_expert_prior(base, name, "deepseek-learned")
             paths["deepseek_topk"].append(name)
         elif isinstance(module, DeepseekV4HashRouter):
             if (
@@ -360,6 +378,7 @@ def configure_fast_moe_ranking(model: torch.nn.Module) -> dict[str, Any]:
                     f"DeepSeek hash router {name!r} does not match 4096/256/top-6 sqrtsoftplus."
                 )
             module.forward = MethodType(_deepseek_hash_router_forward, module)
+            _bind_router_expert_prior(base, name, "deepseek-hash")
             paths["deepseek_hash"].append(name)
 
     if model_type in {"qwen3_5_moe", "qwen3_5_moe_text"} and len(paths["qwen"]) != 40:

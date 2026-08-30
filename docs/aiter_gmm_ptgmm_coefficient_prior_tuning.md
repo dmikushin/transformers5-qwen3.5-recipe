@@ -1,140 +1,112 @@
 # AITER GMM and PTGMM coefficient-prior tuning
 
-## Status and scope
+This document defines the reproducible tuning protocol for the AITER `gmm` and `ptgmm` configurations in this repository. The production authority remains `moe_gmm_configs.py`. AITER source and operator contracts are not modified by the tuner.
 
-This record owns the gfx1151 tuning method and evidence for the exact AITER `gmm` and `ptgmm` configurations used by routed MoE LoRA training in this repository. The production authority is `moe_gmm_configs.py`. `~/torch-ggml-ops/bench/aiter_gmm_heuristics.py` is kept numerically identical so grouped-MMQ comparator tooling and training cannot diverge on an exact key. AITER source code was not modified.
+The tuner searches exact supported shape keys with bounded coordinate descent. It is a benchmark tool, not a production route dispatcher and not a claim about model quality or training-wide route frequency.
 
-The complete table contains 66 GMM keys `(total routed rows, K, N, RHS layout)` and 33 PTGMM keys `(total routed rows, K, N)`. A prior route-aware campaign had already covered the 24 full-rank base-model GMM keys. This campaign therefore screened the remaining 42 rank-4 LoRA GMM keys and all 33 PTGMM keys, including both rank-4 and full-rank matrix shapes.
+## One prior law per run
 
-'Base model' and 'LoRA' identify matrix-shape families only. They are not router priors, runtime labels, checkpoint states, adapter states, or production-frequency classes. A full-rank PTGMM benchmark key does not make the frozen packed base weights trainable. Runtime dispatch remains exact shape and layout dispatch and fails closed for unknown keys.
+Every tuner invocation selects exactly one value of `--expert-prior`:
 
-The routed row counts at sequence length 2,048 are:
+| Prior | Family | Top-k | Law |
+|---|---|---:|---|
+| `qwen-learned` | Qwen | 8 | fitted learned support and rank curve |
+| `deepseek-learned` | DeepSeek | 6 | fitted learned support and rank curve |
+| `deepseek-hash` | DeepSeek | 6 | fitted persistent-head plus Dirichlet body |
 
-| Family | Physical B1 | Physical B4 | Physical B16 |
+The coefficient definitions are implemented in `expert_distribution_prior.py` and numerically match `torch-ggml-ops/bench/workload_prior.py`. A DeepSeek learned draw and a DeepSeek hash draw are separate campaigns. They are never averaged, pooled, or combined with a `40/43` versus `3/43` production weighting. The campaign runner defaults to one Qwen learned campaign and two separate DeepSeek campaigns.
+
+The only workload input to a fitted law is the physical token count `T = physical_batch * 2048`. The sampler uses the fitted residual laws, exact constrained largest-remainder rounding, and a deterministic expert-identity permutation. It preserves exactly `top_k * T` routed rows and keeps every hash expert active. Seeds are recorded in each report.
+
+DeepSeek V4 uses both route laws in one model. `model.layers[0]`, `model.layers[1]`, and `model.layers[2]` are `hash_moe` layers with `DeepseekV4HashRouter`, so their routed expert modules use `deepseek-hash`. `model.layers[3]` through `model.layers[42]` are ordinary `moe` layers with `DeepseekV4TopKRouter`, so their routed expert modules use `deepseek-learned`. The two prior values select configurations for the same B1/B4/B16 row counts and expert matrix geometries. They must not be pooled or assigned by a model-wide compromise. The dense `shared_experts` MLP and the router's own linear are outside this GMM/PTGMM route-prior table.
+
+The current GGUF training path uses packed MMQ for frozen base expert projections and input gradients, while AITER GMM/PTGMM handles the rank-4 LoRA factors. Base-shaped entries are retained for future non-packed base-kernel tuning and are not evidence that the current packed path invokes those entries.
+
+The routed row counts are:
+
+| Family | B1 | B4 | B16 |
 |---|---:|---:|---:|
 | DeepSeek top-6 | 12,288 | 49,152 | 196,608 |
 | Qwen top-8 | 16,384 | 65,536 | 262,144 |
 
-The newly screened GMM shape inventory is:
+No captured histogram, checkpoint, layer identity, training step, or route corpus is consumed by the coefficient prior.
 
-| Family | Transposed RHS | Row-major RHS |
-|---|---|---|
-| DeepSeek rank-4 | `4096x4`, `2048x4`, `4x4096` | `4x4096`, `4x2048`, `4096x4` |
-| Qwen rank-4 | `2048x4`, `512x4`, `4x1024`, `4x2048` | `4x2048`, `4x512`, `1024x4`, `2048x4` |
+## Route bank
 
-The PTGMM inventory is:
+`route_bank_for_routed_rows()` creates the complete route bank before any timed AITER call. The default bank has 128 vectors. The first route seed is `8,314,159 + physical_batch * 104,729`, with the DeepSeek hash offset applied by the canonical prior module. An explicit `--route-seed` is also supported.
 
-| Family | Rank-4 shapes | Full-rank shapes |
-|---|---|---|
-| DeepSeek | `4096x4`, `2048x4`, `4x4096` | `4096x2048`, `2048x4096` |
-| Qwen | `2048x4`, `512x4`, `4x1024`, `4x2048` | `2048x512`, `512x2048` |
+A `RouteVector` records:
+- the selected prior, seed, token count, top-k, row total, and row digest.
+- compact active `expert_indices`.
+- cumulative `expert_offsets` over the compact active experts.
+- `group_sizes`, a full 256-entry tuple indexed by physical expert ID.
 
-## Coefficient-only priors
+AITER currently receives the full `group_sizes` tensor because its GMM/PTGMM calls own all 256 RHS experts. The compact indices and offsets are retained as route provenance and make the active-order interpretation explicit. They are not silently substituted for the AITER group-size contract.
 
-No captured expert histogram, model checkpoint, layer identity, training step, or route corpus is consumed by the tuner. The only workload variable supplied to a learned prior is `T = physical_batch * sequence_length`, with reference token count `T0 = 2048`.
+A route vector is one complete workload: every expert group size is selected as a unit. The route bank is generated once for a target and reused for every configuration comparison in that target. Numeric input tensors are also created once per target with a deterministic CUDA generator and are reused by both configurations. Route generation, tensor allocation, validation, and kernel compilation are outside measured CUDA events.
 
-For a learned router, active support `A` and ranked exponent `alpha` are sampled from:
+## Timing protocol
 
-`x = log(T / 2048)`
+The defaults are:
 
-`log((A + 0.5) / (256 - A + 0.5)) = a0 + a_log_tokens * x + epsilon_A`
+| Setting | Default |
+|---|---:|
+| initial samples (`--repeats`) | 16 |
+| maximum samples (`--max-samples`) | 128 |
+| expansion (`--sample-step`) | 16 |
+| confidence | 90% |
+| estimate epsilon | 2% |
+| stable rounds | 2 |
+| noise floor | 0.5% |
+| warmup launches per route | 2 |
+| timed launches per sample | 1 |
 
-`log(alpha) = b0 + b_log_tokens * x + b_active_residual * epsilon_A + epsilon_alpha`
+The sample unit is a route vector, not a profile aggregate. For route index `i`, exactly one baseline timing sample and one candidate timing sample are recorded. The second launch is first on odd indices and the baseline is first on even indices. This alternating order is part of the report and reduces systematic position effects.
 
-For ranks `r = 1..A`, the sampler computes `q_r = min(1, C * (r + shift)^(-alpha))`, chooses `C` so that `sum(q_r) = top_k`, adjusts the first rank by the fitted head multiplier while preserving the total, applies constrained largest-remainder rounding to `T * q_r`, and randomly permutes physical expert identities. Ranks above `A` receive zero rows.
+`--launches-per-sample N` runs `N` launches for each implementation inside the same timed event pair and stores the average milliseconds as the one sample for that route vector. The route, inputs, and output contract remain fixed across those launches. It does not create `N` independent route samples and does not permit mixing route vectors.
 
-The learned coefficients are:
+For every implementation, raw route samples are retained. Summaries are computed in log-time space with a robust scale estimate using standard deviation, MAD, IQR, and the configured noise floor. Adaptive expansion stops only after the configured number of consecutive rounds satisfies both:
+- the paired log-speedup confidence interval is within epsilon.
+- the cumulative log-speedup estimate changed by no more than epsilon from the previous round.
 
-| Parameter | Qwen learned | DeepSeek learned |
-|---|---:|---:|
-| `top_k` | 8 | 6 |
-| `shift` | 11.5465232873 | 6.3223820835 |
-| head multiplier | 1.1255020052 | 1.0643729189 |
-| `a0` | 1.3568429238 | 2.2468973539 |
-| `a_log_tokens` | 1.1367804236 | 0.8906164814 |
-| `b0` | 0.7376182182 | 0.4081577973 |
-| `b_log_tokens` | -0.0215993943 | -0.0211298377 |
-| `b_active_residual` | -0.1730074363 | -0.0754167931 |
+The primary paired speedup is:
 
-Qwen uses `epsilon_A ~ clip(StudentT(8.3978226526, -0.0335118652, 0.9830493404), [-2.5036492445, 3.7809143778])` and `epsilon_alpha ~ clip(StudentT(5.2038953632, 0.0054814884, 0.1025706842), [-0.4463245132, 0.3833201702])`.
+`exp(median(log(baseline_ms)) - median(log(candidate_ms)))`
 
-DeepSeek learned routing uses `epsilon_A ~ clip(StudentT(33.5987235964, -0.0013194870, 0.8328268568), [-1.6829685257, 2.7587218851])` and `epsilon_alpha ~ clip(StudentT(5.1551932778, -0.0071110386, 0.0923527684), [-0.3180690433, 0.3604795507])`.
+The report contains raw samples, per-round confidence bounds, stop reason, route order, sample count, policy values, and the full deterministic route bank. A candidate is accepted only when the final paired result exceeds `1 + --min-gain` and the existing correctness check passes.
 
-The capture-free DeepSeek hash prior samples a persistent head share `rho` and exchangeable Dirichlet body. Its coefficients are `mu_rho = 0.076568603515625`, `kappa_rho = 111.40091020461985`, `body_a0 = 6.660030508273053`, and `body_log_tokens_exponent = 0.4771750368253468`. For `B = T / 2048`, the beta concentration is `B * (kappa_rho + 1) - 1`, the body concentration is `body_a0 * B^body_log_tokens_exponent`, six randomly permuted head experts divide `rho`, and bounded largest-remainder rounding produces exactly `6T` rows with every hash expert active.
+## Search and correctness
 
-The tuning profiles are deliberately small and unweighted. For physical batch `B`, the base seed is `8,314,159 + B * 104,729`. Qwen learned profile A uses that seed and profile B adds `1,000,003`, while DeepSeek learned uses the base seed and DeepSeek hash adds `31,000`. Qwen therefore uses two deterministic learned-prior draws. DeepSeek uses one deterministic learned-prior draw and one deterministic hash-prior draw with equal standing. The production layer ratio of 40 learned routers to 3 hash routers is not used. This is per-kernel tuning, not an estimate of training-wide frequency.
+Each exact target starts from its current production configuration. The tuner changes only the supported fields `BLOCK_SIZE_M`, `BLOCK_SIZE_K`, `BLOCK_SIZE_N`, `GROUP_SIZE`, `GRID_DIM`, `num_warps`, and `num_stages`. It uses bounded coordinate descent. Invalid shared-memory products and launch errors reject only that candidate.
 
-The generated profile geometry was:
+Correctness compares the baseline and selected configuration on a deterministic sparse boundary route with group sizes `[2, 0, 3]`. This check is separate from performance route-bank sampling and does not change the selected prior law.
 
-| Family/profile | B1 active / max rows | B4 active / max rows | B16 active / max rows |
-|---|---:|---:|---:|
-| Qwen learned A | 233 / 1,297 | 253 / 4,192 | 253 / 20,802 |
-| Qwen learned B | 241 / 941 | 253 / 5,055 | 243 / 32,768 |
-| DeepSeek learned | 244 / 982 | 253 / 3,441 | 254 / 12,476 |
-| DeepSeek hash | 256 / 264 | 256 / 942 | 256 / 3,765 |
+## Commands
 
-## Search method
+A single target can be run as follows. The expert prior determines the route family:
 
-Every target is tuned independently from its current exact-key configuration. The seven serialized fields are `BLOCK_SIZE_M`, `BLOCK_SIZE_K`, `BLOCK_SIZE_N`, `GROUP_SIZE`, `GRID_DIM`, `num_warps`, and `num_stages`.
+```bash
+python tune_coefficient_prior_gmm.py \
+  --expert-prior deepseek-learned \
+  --batch 4 --op ptgmm --k 4096 --n 4 \
+  --output results/deepseek-learned-ptgmm.json
+```
 
-The search is one bounded coordinate pass rather than a Cartesian product. For each field, all other fields remain fixed at the current coordinate winner. Candidate domains are powers of two already supported by AITER: M tiles `16, 32, 64, 128, 256` with PTGMM `512` only for sufficiently large B16 groups, K tiles `16, 32` for rank-small K and otherwise `32, 64, 128, 256` for GMM or `64, 128, 256, 512` for PTGMM, N tiles `16, 32` for rank-small N and otherwise `32, 64, 128, 256, 512`, group sizes `1, 2, 4, 8`, grid dimensions `20, 40, 80, 160, 256`, warps `1, 2, 4, 8`, and stages `1, 2, 3`. The current value is always retained even when it lies outside a reduced slice. Shared-memory-impossible products are pruned and compile or launch errors reject only that candidate.
+The campaign runner passes the same protocol arguments to each target. Its output names include the prior, so learned and hash results cannot overwrite or be mistaken for one another:
 
-The screen used 5 ms warmup, 8 ms measurement windows per coefficient profile, and a 25 ms final baseline-versus-candidate measurement. A provisional candidate needed more than a one-percent aggregate gain. This screen produced 35 provisional candidates from 75 targets.
+```bash
+python run_coefficient_prior_campaign.py \
+  --output-dir results/gmm_campaign --expert-prior deepseek-learned
+```
 
-Every provisional candidate then received 25 alternating-order single-launch timings on each coefficient profile. Promotion required bitwise equality to the old config on a 256-group sparse boundary control, aggregate speedup greater than two percent, and no coefficient profile below `0.99x`. Twenty-five candidates passed: eight GMM and seventeen PTGMM. Fifty targets retained their prior configurations, including ten provisional screen winners that failed the longer confirmation.
+Confirmation replays the source report's one prior law, route seed, complete route bank, warmup, launch multiplicity, and adaptive policy. It refuses to time if regenerated route metadata does not exactly match the source report:
 
-Each promoted config was also checked against an independent per-group `torch.float32` matmul reference rounded to BF16 on group sizes `[2,0,3]`, then rerun after an input mutation. All 25 passed. The maximum relative RMSE was `6.173e-5`, the minimum cosine was `0.99999988`, and every mutation changed the expected active output.
-
-## Confirmed changes
-
-Config tuples below use `(BLOCK_SIZE_M, BLOCK_SIZE_K, BLOCK_SIZE_N, GROUP_SIZE, GRID_DIM, num_warps, num_stages)`.
-
-| Operator | Exact key | Old config | New config | Aggregate speedup | Minimum profile |
-|---|---|---|---|---:|---:|
-| GMM | `(12288,2048,4,T)` | `(64,256,16,4,20,4,2)` | `(16,256,16,2,40,4,3)` | 1.2444x | 1.1924x |
-| GMM | `(12288,4,4096,T)` | `(32,16,64,4,256,2,3)` | `(32,16,64,8,256,2,2)` | 1.0213x | 1.0143x |
-| GMM | `(49152,4,4096,T)` | `(32,16,64,8,160,2,1)` | `(64,16,32,1,160,2,2)` | 1.0853x | 1.0534x |
-| GMM | `(49152,4,4096,N)` | `(16,16,128,2,256,1,1)` | `(16,16,128,1,160,1,1)` | 1.0466x | 1.0357x |
-| GMM | `(65536,4,2048,T)` | `(32,16,64,4,160,2,2)` | `(32,16,64,1,160,2,2)` | 1.0493x | 1.0414x |
-| GMM | `(65536,4,2048,N)` | `(16,16,128,8,160,1,1)` | `(16,16,128,2,160,1,2)` | 1.0348x | 1.0322x |
-| GMM | `(196608,4096,4,N)` | `(16,128,16,4,160,2,1)` | `(16,64,16,1,160,1,1)` | 1.0218x | 1.0218x |
-| GMM | `(262144,4,1024,T)` | `(32,16,64,8,160,2,2)` | `(32,16,64,1,160,2,1)` | 1.0384x | 1.0358x |
-| PTGMM | `(12288,2048,4)` | `(16,128,16,2,160,4,1)` | `(16,64,16,1,160,1,1)` | 1.0471x | 1.0390x |
-| PTGMM | `(12288,4,4096)` | `(64,16,256,8,160,4,1)` | `(64,16,256,1,80,4,1)` | 1.0249x | 1.0046x |
-| PTGMM | `(49152,4096,4)` | `(16,512,16,1,80,8,1)` | `(32,512,16,2,80,8,1)` | 1.0409x | 1.0288x |
-| PTGMM | `(49152,4096,2048)` | `(16,64,256,8,80,4,1)` | `(16,64,256,8,80,4,3)` | 1.0376x | 1.0101x |
-| PTGMM | `(49152,2048,4096)` | `(16,64,512,2,40,8,1)` | `(16,64,512,2,40,8,3)` | 1.1029x | 1.0528x |
-| PTGMM | `(196608,4096,2048)` | `(16,64,256,1,80,4,1)` | `(16,64,256,4,80,4,1)` | 1.0507x | 0.9978x |
-| PTGMM | `(16384,2048,4)` | `(16,128,16,8,80,4,2)` | `(16,256,16,8,80,4,1)` | 1.0487x | 1.0391x |
-| PTGMM | `(16384,2048,512)` | `(16,64,128,1,80,8,3)` | `(16,64,256,1,80,8,2)` | 1.0672x | 1.0666x |
-| PTGMM | `(16384,512,2048)` | `(16,64,128,4,80,8,3)` | `(16,64,256,4,80,8,1)` | 1.0798x | 1.0779x |
-| PTGMM | `(65536,2048,4)` | `(64,512,16,1,80,8,1)` | `(32,512,16,4,80,8,1)` | 1.0327x | 0.9985x |
-| PTGMM | `(65536,512,4)` | `(64,128,16,1,20,4,1)` | `(64,128,16,1,80,4,2)` | 1.1481x | 1.1474x |
-| PTGMM | `(65536,4,1024)` | `(16,16,128,8,80,2,1)` | `(32,16,64,4,80,2,2)` | 1.1090x | 1.1036x |
-| PTGMM | `(262144,2048,4)` | `(64,256,16,1,40,4,1)` | `(64,256,16,1,256,4,1)` | 1.0408x | 1.0278x |
-| PTGMM | `(262144,512,4)` | `(64,256,16,2,20,8,2)` | `(64,128,16,4,160,8,2)` | 1.1467x | 1.1367x |
-| PTGMM | `(262144,4,1024)` | `(16,16,128,2,80,2,1)` | `(32,16,64,1,80,4,3)` | 1.1642x | 1.1641x |
-| PTGMM | `(262144,4,2048)` | `(64,16,256,1,40,4,1)` | `(64,16,256,8,256,4,1)` | 1.0391x | 1.0238x |
-| PTGMM | `(262144,512,2048)` | `(32,128,256,2,40,8,3)` | `(32,128,256,1,40,8,3)` | 1.1313x | 1.1163x |
-
-The two sub-one minimum-profile ratios are bounded route-component compromises, not hidden production weighting: DeepSeek B16 PTGMM `(4096,2048)` measured `0.9978x` on its weaker equal-standing profile while gaining `1.0507x` in the unweighted aggregate, and Qwen B4 PTGMM `(2048,4)` measured `0.9985x` on its weaker profile while gaining `1.0327x` in aggregate. Both satisfy the predefined `0.99x` per-profile floor.
+```bash
+python confirm_coefficient_prior_gmm.py \
+  --input-dir results/gmm_campaign \
+  --output results/gmm_campaign/confirmation.json
+```
 
 ## Evidence boundary
 
-The fit coefficients are benchmark priors. They do not establish production route frequency, checkpoint invariance, layer invariance, or model-quality effects. The deterministic profiles make config comparisons reproducible but do not exhaust the fitted residual distributions. Captured routes were intentionally excluded from candidate generation, ranking, and confirmation.
-
-The search is bounded coordinate descent and does not prove global optimality. It does not test Cartesian combinations that require moving several fields simultaneously before any intermediate coordinate improves. Rejected screen candidates remain rejected for this campaign even if a shorter timing window looked favorable.
-
-The campaign does not alter AITER kernels, operator contracts, factor layouts, group-size ownership, autograd behavior, or dispatch dimensions. It changes only exact config values for already-supported keys. Unknown shapes still fail closed.
-
-## Artifacts
-
-Per-target screen reports and logs are under `~/tmp/test_no_unsloth/gmm_coefficient_campaign/`.
-
-The 25-repeat confirmation artifact is `~/tmp/test_no_unsloth/gmm_coefficient_campaign/confirmation_25.json`.
-
-The compact campaign authority is `~/tmp/test_no_unsloth/gmm_coefficient_campaign/campaign_summary.json`.
-
-The independent-reference and mutation artifact is `~/tmp/test_no_unsloth/gmm_coefficient_campaign/correctness.json`.
-
-The self-contained coefficient sampler and tuner are `~/tmp/test_no_unsloth/tune_coefficient_prior_gmm.py`, `~/tmp/test_no_unsloth/run_coefficient_prior_campaign.py`, and `~/tmp/test_no_unsloth/confirm_coefficient_prior_gmm.py`.
+The fitted laws are workload priors. Deterministic route banks make paired configuration comparisons reproducible, but they do not exhaust the residual distributions or establish production frequency. The bounded coordinate search does not prove global optimality. Historical result documents in `torch-ggml-ops` remain unchanged and are not rewritten by this protocol.
