@@ -235,9 +235,12 @@ def _deepseek_v4_csa_module_forward(
     attention_output = deepseek_v4_csa_attention(
         query, local_kv, compressed_kv, module.sinks
     )
+    # Rotate in BSHD so the RoPE concat stays dense and the grouped fold below is
+    # a view. The BHSD round trip makes that reshape copy the whole attention
+    # output (128 MiB per layer at batch 1, 2 GiB at batch 16, over 41 layers).
     attention_output = apply_rotary_pos_emb(
-        attention_output.transpose(1, 2), cos, -sin
-    ).transpose(1, 2)
+        attention_output, cos, -sin, unsqueeze_dim=2
+    )
     grouped = attention_output.reshape(*input_shape, module.config.o_groups, -1)
     grouped = module.o_a_proj(grouped).flatten(2)
     return module.o_b_proj(grouped), None
@@ -323,9 +326,12 @@ def _deepseek_v4_hca_module_forward(
     attention_output = deepseek_v4_hca_attention(
         query, local_kv, compressed_kv, module.sinks
     )
+    # Rotate in BSHD so the RoPE concat stays dense and the grouped fold below is
+    # a view. The BHSD round trip makes that reshape copy the whole attention
+    # output (128 MiB per layer at batch 1, 2 GiB at batch 16, over 41 layers).
     attention_output = apply_rotary_pos_emb(
-        attention_output.transpose(1, 2), cos, -sin
-    ).transpose(1, 2)
+        attention_output, cos, -sin, unsqueeze_dim=2
+    )
     grouped = attention_output.reshape(*input_shape, module.config.o_groups, -1)
     grouped = module.o_a_proj(grouped).flatten(2)
     return module.o_b_proj(grouped), None

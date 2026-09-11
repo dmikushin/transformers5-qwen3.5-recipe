@@ -311,6 +311,12 @@ Rejected or deferred:
 - Reopen an attention family only when a larger fusion beats its complete producer-plus-attention boundary and preserves its exact gradients, state ownership, and checkpoint replay.
 - A BSHD-layout retune of CSA/HCA is parked on the `csa-hca-bshd` branch. The accepted contract remains BHSD Q/KV with contiguous BSHD output.
 
+Reopened item: the CSA/HCA family forwards moved the post-attention output rotation to BSHD (`unsqueeze_dim=2`), which removed a 128 MiB/layer reshape copy but changed the gradient the attention backward receives from a BHSD-backed view to a contiguous BSHD tensor. The key-owner dV kernels are up to 2x slower with that layout, and the component benchmarks previously fed the BHSD-backed view, so the cost was hidden until the full-step trace.
+
+Stage 0 restored the production layout in the CSA/HCA benchmarks. Stage 1 retuned the key-owner launch tables with paired sampling (CSA backward -8.8%/-4.1%/-0.8% at B1/B4/B16, HCA -7.9%/-1.4%/-0.3%, all with bitwise-identical gradients). See `plan_deepseek_v4_csa_backward.md` and `plan_deepseek_v4_hca_backward.md` for the tables, rejected candidates, and the stride diagnostic.
+
+The remaining Stage 2 direction is copy-free: rotate in BHSD and let the grouped output-A projection consume the BHSD tensor directly. A backward-side `dO` staging transpose was implemented and measured first. It is rejected because the staging copy costs about what the key owners recover at B1/B4 (CSA -0.90% / -0.95% complete, HCA -1.59% / -0.23%) and more at B16 (CSA +1.57%, HCA +1.97%), while adding 128/512/2048 MiB of transient allocation per layer. The copy-free path removes the round trip and the staging copy but makes the grouped-MMQ activation reads strided, so it must be measured at the complete producer-plus-attention boundary before adoption. Details, permute-bandwidth evidence, and rejection criteria are in `plan_deepseek_v4_csa_backward.md` and `plan_deepseek_v4_hca_backward.md`.
+
 ### Routing
 
 - `fast_moe_ranking.py` owns Qwen top-eight and DeepSeek top-six/hash ranking.

@@ -167,3 +167,9 @@ Primary artifacts:
 ~/tmp/test_no_unsloth/deepseek_v4_sliding_grad_score_state_comparison.json
 ~/tmp/test_no_unsloth/deepseek_v4_sliding_sink_delta_identity.json
 ```
+
+## Production dO layout
+
+Sliding attention still consumes the stock `DeepseekV4Attention.forward` post-attention rotation (`apply_rotary_pos_emb(attn_output.transpose(1, 2), cos, -sin).transpose(1, 2)`), so the production `dO` remains a BHSD-backed view and the retained launch tables stay representative. The full-step trace confirms it: `_sliding_dv_kernel` -1.4%, `_sliding_dq_delta_kernel` -1.7%, and `_sliding_grouped_forward_kernel` -5.6%/+4.2% versus the Aug-1 trace, while the CSA/HCA key owners regressed up to 2x over the same interval. The +9.7% on `_sliding_dk_kernel` matches the +10% drift seen on other layout-independent kernels across the torch/ROCm upgrade.
+
+`benchmark_deepseek_v4_sliding_attention.py` already builds `output_gradient` as `randn_like(query).transpose(1, 2)`, which matches production. A comment now records that. No sliding retune was performed in Stage 1, and the sliding tables must not be changed to the BSHD-tuned CSA/HCA values. Stage 2 concluded with no staging in production (the backward `dO` transpose was rejected by the complete-boundary gate), so the sliding path is unchanged. Any future `dO` staging or grouped-output layout work must apply the same paired-sampling protocol and complete-boundary validation here.

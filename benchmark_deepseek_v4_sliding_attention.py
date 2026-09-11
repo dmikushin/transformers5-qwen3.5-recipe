@@ -83,6 +83,8 @@ def make_inputs(batch: int, seed: int):
         dtype=torch.bfloat16,
     )
     sink = torch.randn(_QUERY_HEADS, device="cuda", dtype=torch.float32)
+    # The model feeds the sliding attention a BHSD-backed output gradient, unlike
+    # CSA/HCA which receive contiguous BSHD.
     output_gradient = torch.randn_like(query).transpose(1, 2)
     return query, shared_kv, sink, output_gradient
 

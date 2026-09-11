@@ -4,6 +4,8 @@
 
 Accepted and optimization-exhausted for batches 1/4/16 at S2048 on `gfx1151`. Both post-HCA ownership experiments are complete and accepted: deterministic group-2 compressed-gradient partials at every batch, and B16-only two-phase dS/D256 dQ ownership. Custom backward covers the fused two-region attention and rate-4 producer. Exact component, non-reentrant checkpoint, compiler, allocation, and prior real GGUF update gates pass.
 
+Reopened for the production contiguous-BSHD `dO` layout. The tables below were measured while the component benchmark fed a BHSD-backed `dO` view. The full model now feeds a contiguous BSHD `dO` after the post-attention rotation moved to BSHD (`deepseek_v4_attention.py`, commit `5ec3113`), and the key-owner dV kernels are up to 2x slower with that layout. Stage 1 retuning results are in "Production dO layout and Stage 1 key-owner retune" at the end of this document.
+
 ## Gradient contract
 
 Attention backward returns:
@@ -174,3 +176,89 @@ The complete sliding-backward experiment record was re-reviewed. Raw FP16 handof
 The HCA-derived compressed head-partial schedule and the B16 two-phase dS/dQ ownership change both pass their complete-boundary gates. Remaining B16 cost is explained by 49.8 million visible pairs per batch element, repeated probability reconstruction for dV/dS, long imbalanced triangular traversal, and the still spill-heavy 64 KiB dS owner. The final D256 dQ phase itself is no longer pressure-bound.
 
 At the end of this plan, review the current CSA forward and backward kernels together, all completed producer/attention work, the accepted and rejected sliding-forward/backward evidence, and the relevant AITER, llama.cpp, DS4, vLLM, SGLang, Transformers, and Triton resources. Any new speed or memory idea must be added to these plans before implementation and evaluated at the complete producer-plus-attention boundary. CSA backward optimization is exhausted for this fixed contract.
+
+## Production dO layout and Stage 1 key-owner retune
+
+### Stage 0: benchmark protocol correction
+
+`benchmark_deepseek_v4_csa.py` used to build `dO` as `torch.randn_like(query).transpose(1, 2)` (a BHSD-backed view). The model feeds a contiguous BSHD gradient: instrumenting `_CSAAttentionFunction.backward` in the full model shows shape `[1,2048,64,512]`, stride `(67108864, 32768, 512, 1)`, `contiguous=True`. The query owner, the forward kernels, and the producer are layout-insensitive. The local and compressed dV owners are not, so the old benchmark hid a real cost. The benchmark now feeds the production layout in both `run_correctness` and `run_benchmark`.
+
+Stage 0 production-layout baseline (median of 10, B1/B4/B16):
+
+| Batch | Forward | Backward | Complete |
+|---:|---:|---:|---:|
+| 1 | 14.594 ms | 27.728 ms | 42.322 ms |
+| 4 | 57.563 ms | 103.892 ms | 161.456 ms |
+| 16 | 108.406 ms | 343.814 ms | 452.220 ms |
+
+### Stage 1: launch-table retune
+
+Every candidate was measured with paired sampling: each round profiles the base and every candidate once (alternating order) and the per-round gap is `log(t_candidate) - log(t_base)`. A candidate is adopted only when the 95% interval on the median paired gap is entirely below the 2% indifference zone (`~/evotensile/docs/noisy_measurements.md`). This cancels the 5-20% run-to-run drift seen in single runs. Every adopted candidate produced bitwise-identical gradients (min cosine 1.0, relative RMSE 0.0), because the per-output accumulation order is unchanged.
+
+Adopted changes (kernel-level paired gaps):
+
+| Batch | Owner | Change | Paired gap |
+|---:|---|---|---:|
+| 1 | local dV | `block_n` 32 -> 64, `waves_per_eu` 1 -> 2 | -22.7% [-28.3, -16.7] |
+| 4 | local dV | `waves_per_eu` 1 -> 2 | -9.5% [-14.4, -4.2] |
+| 1 | compressed dV | `waves_per_eu` 1 -> 2, `head_unroll` 1 -> 2 | -17.3% [-18.2, -16.4] |
+| 4 | compressed dV | `block_m` 16 -> 32, `waves_per_eu` 1 -> 2 | -17.2% [-17.9, -16.4] |
+| 4 | compressed dK | `head_unroll` 1 -> 2 | -9.1% [-10.2, -8.1] |
+| 16 | compressed dV | `waves_per_eu` 1 -> 2 | -2.4% [-2.7, -2.1] |
+| 16 | compressed dK | `head_unroll` 2 -> 1 | -9.5% [-10.8, -8.1] |
+
+Retained without change: local dK at every batch (all candidates tied or regressed), B16 local dV (`waves_per_eu=2` measured -1.4% [-4.0, +1.3]), B1/B4 dK partial geometry.
+
+Rejected by measurement: local dV `block_n` 128 (+207% [+180, +237]) and 256 (+669%), `block_m` 64 (+20% to +102%), `num_warps` 4 (+9% to +200% depending on batch), `head_unroll` 2 (+23% [+13, +35]) and 4 (+31%). Compressed dV `block_n` 16 (+20%) and 64 (+49%), `num_warps` 4 (+164%), `block_m` 8/32/128 (regressions). Compressed dK `block_n` 16 (+45%) and 64 (+175%), `block_m` 8 (+73%) and 32 (+57%).
+
+Large `block_m`/`head_unroll` combinations were discarded as non-compiling: the `block_m=128, head_unroll=2` candidate failed with Triton `OutOfResources: shared memory` (required 131072 B, hardware limit 65536 B), consistent with the 64 KiB LDS contract.
+
+### Stage 1b: stride diagnostic
+
+A padded BSHD `dO` (head extent 520, sequence stride 33280 elements instead of 32768) recovered 9.6% [8.4, 10.9] of the local-dV gap but made `_compressed_dv_partial_kernel` 114.6% slower, so no single padded staging layout helps every owner. The BHSD-backed view recovered the full 23.8% local and 34.0% compressed gap, making it the only complete staging layout. It was then measured end-to-end and rejected in Stage 2 below because the permute copy consumes the savings.
+
+### Final production medians after Stage 1 (median of 20)
+
+| Batch | Forward | Backward | Complete | Backward delta vs Stage 0 |
+|---:|---:|---:|---:|---:|
+| 1 | 15.351 ms | 25.295 ms | 40.646 ms | -8.8% |
+| 4 | 57.585 ms | 99.617 ms | 157.202 ms | -4.1% |
+| 16 | 108.655 ms | 341.196 ms | 449.851 ms | -0.8% |
+
+Forward is untouched by these configs and moved by up to 5% between runs, which measures the complete-boundary run-to-run noise. The remaining gap is the local dV owner (still about 1.7x its BHSD-backed cost at B1) and the compressed dV partial owner (about 1.5x). A backward-side transpose of `dO` was implemented and measured in Stage 2 below. It is rejected by the complete-boundary gate.
+
+### Fail-closed guard added
+
+`_launch_compressed_partial` now rejects `block_n` that does not divide `_COMPRESSED_LENGTH`. A sweep candidate with `block_n=32` for HCA silently corrupted gradients (cosine 0.799). The same class of misconfiguration in CSA is now rejected before launch.
+
+## Stage 2: backward dO staging (rejected by measurement)
+
+A whole-backward staged copy of `dO` into the BHSD-backed order was implemented and measured, then rejected and reverted. No staging code remains in production.
+
+### Permute kernel
+
+A Triton row-permute copies contiguous BSHD `dO` into a BHSD-backed buffer. Source rows advance in memory order (`sequence * QUERY_HEADS + head`) and each `HEAD_DIM`-wide run is written to destination row (`head * SEQUENCE_LENGTH + sequence`). The staged view was passed to the whole backward, so the copy is paid once per layer and the query owner reads the same fast layout. Every tested variant produced bitwise-identical gradients.
+
+| Permute implementation (1 GiB of traffic per pass) | Time | Bandwidth |
+|---|---:|---:|
+| `transpose(1, 2).contiguous()` (torch) | 3.76 ms | 66 GB/s |
+| gather (strided reads, contiguous writes) | 2.00 ms | 125 GB/s |
+| scatter (contiguous reads, permuted writes) | 1.29 ms | 193 GB/s |
+| scatter with `.cg` load / `.cs` or `.wt` store | 1.28 ms | 196 GB/s |
+| contiguous clone (reference) | 1.25 ms | 200 GB/s |
+
+The gfx1151 read+write copy bandwidth is the ceiling. Cache modifiers do not move it. The staged buffer adds 128 MiB / 512 MiB / 2 GiB of transient allocation per layer at B1/B4/B16.
+
+### Complete-boundary result (paired, 8 rounds)
+
+| Batch | Staging off | Staging on | Gap |
+|---:|---:|---:|---:|
+| 1 | 40.399 ms | 40.008 ms | -0.90% [-1.39, -0.41] |
+| 4 | 157.157 ms | 155.702 ms | -0.95% [-1.40, -0.49] |
+| 16 | 448.295 ms | 455.520 ms | +1.57% [+1.27, +1.87] |
+
+Kernel-level paired gaps (6 profiled rounds) were `_local_dv_kernel` -24.8% / -33.3% / -36.2%, `_compressed_dv_partial_kernel` -34.6% / -38.0% / -24.4%, and `_csa_dq_kernel` +0.8% / -1.28% / +0.3% at B1/B4/B16. The dV savings are consistently large. The copy cost consumes them at B1/B4 and exceeds them at B16.
+
+### Decision
+
+Rejected. The ~1% B1/B4 complete gain does not justify a batch-gated production behavior, the +2 GiB B16 transient, or the +128/512 MiB transient at B1/B4 (the documented component incremental peaks are 451.6 / 1806.3 / 6200.5 MiB). The copy-free alternative is to rotate in BHSD and let the grouped output-A projection consume the BHSD tensor directly: that removes the round trip and the staging copy, but its grouped-MMQ activation reads become strided and it must be measured at the complete producer-plus-attention boundary before adoption. Fusing the staging into the query owner is not possible in the accepted order: the key owners run before the query owner because the query owner overwrites the raw scores with `dS`, and a second score/`dS` state is explicitly rejected.

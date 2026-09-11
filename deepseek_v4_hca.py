@@ -60,9 +60,9 @@ _LOCAL_DKV_CONFIGS = {
     1: {
         "dv": {
             "block_m": 32,
-            "block_n": 32,
+            "block_n": 64,
             "num_warps": 8,
-            "waves_per_eu": 1,
+            "waves_per_eu": 2,
             "head_unroll": 1,
         },
         "dk": {
@@ -78,7 +78,7 @@ _LOCAL_DKV_CONFIGS = {
             "block_m": 32,
             "block_n": 32,
             "num_warps": 8,
-            "waves_per_eu": 1,
+            "waves_per_eu": 2,
             "head_unroll": 2,
         },
         "dk": {
@@ -121,7 +121,7 @@ _COMPRESSED_DKV_CONFIGS = {
             "block_n": 16,
             "head_group": 4,
             "num_warps": 4,
-            "waves_per_eu": 2,
+            "waves_per_eu": 1,
         },
     },
     4: {
@@ -146,7 +146,7 @@ _COMPRESSED_DKV_CONFIGS = {
             "block_n": 16,
             "head_group": 16,
             "num_warps": 8,
-            "waves_per_eu": 2,
+            "waves_per_eu": 0,
         },
         "dk": {
             "block_m": 16,
@@ -1762,6 +1762,11 @@ def _launch_compressed_owner(
     kernel, query, grad_output, lse, partial, scores, config, *, is_key: bool
 ):
     block_n = config["block_n"]
+    if block_n > _COMPRESSED_LENGTH or _COMPRESSED_LENGTH % block_n != 0:
+        raise ValueError(
+            "HCA compressed key tiles require block_n to divide "
+            f"{_COMPRESSED_LENGTH}, got {block_n}"
+        )
     head_group = config["head_group"]
     head_groups = triton.cdiv(_QUERY_HEADS, head_group)
     grid = (triton.cdiv(_COMPRESSED_LENGTH, block_n), head_groups, query.shape[0])

@@ -84,9 +84,9 @@ _LOCAL_DKV_CONFIGS = {
     1: {
         "dv": {
             "block_m": 32,
-            "block_n": 32,
+            "block_n": 64,
             "num_warps": 8,
-            "waves_per_eu": 1,
+            "waves_per_eu": 2,
             "head_unroll": 1,
         },
         "dk": {
@@ -102,7 +102,7 @@ _LOCAL_DKV_CONFIGS = {
             "block_m": 32,
             "block_n": 32,
             "num_warps": 8,
-            "waves_per_eu": 1,
+            "waves_per_eu": 2,
             "head_unroll": 2,
         },
         "dk": {
@@ -137,8 +137,8 @@ _COMPRESSED_PARTIAL_CONFIGS = {
             "block_m": 64,
             "block_n": 32,
             "num_warps": 8,
-            "waves_per_eu": 1,
-            "head_unroll": 1,
+            "waves_per_eu": 2,
+            "head_unroll": 2,
             "head_group": 2,
         },
         "dk": {
@@ -152,10 +152,10 @@ _COMPRESSED_PARTIAL_CONFIGS = {
     },
     4: {
         "dv": {
-            "block_m": 16,
+            "block_m": 32,
             "block_n": 64,
             "num_warps": 8,
-            "waves_per_eu": 1,
+            "waves_per_eu": 2,
             "head_unroll": 2,
             "head_group": 2,
         },
@@ -164,7 +164,7 @@ _COMPRESSED_PARTIAL_CONFIGS = {
             "block_n": 32,
             "num_warps": 4,
             "waves_per_eu": 1,
-            "head_unroll": 1,
+            "head_unroll": 2,
             "head_group": 2,
         },
     },
@@ -173,7 +173,7 @@ _COMPRESSED_PARTIAL_CONFIGS = {
             "block_m": 32,
             "block_n": 64,
             "num_warps": 8,
-            "waves_per_eu": 1,
+            "waves_per_eu": 2,
             "head_unroll": 1,
             "head_group": 2,
         },
@@ -182,7 +182,7 @@ _COMPRESSED_PARTIAL_CONFIGS = {
             "block_n": 64,
             "num_warps": 8,
             "waves_per_eu": 0,
-            "head_unroll": 2,
+            "head_unroll": 1,
             "head_group": 2,
         },
     },
@@ -1739,6 +1739,11 @@ def _launch_compressed_partial(
     is_key: bool,
 ):
     block_n = config["block_n"]
+    if block_n > _COMPRESSED_LENGTH or _COMPRESSED_LENGTH % block_n != 0:
+        raise ValueError(
+            "CSA compressed key tiles require block_n to divide "
+            f"{_COMPRESSED_LENGTH}, got {block_n}"
+        )
     head_group = config["head_group"]
     head_groups = _QUERY_HEADS // head_group
     grid = (triton.cdiv(_COMPRESSED_LENGTH, block_n), head_groups, query.shape[0])

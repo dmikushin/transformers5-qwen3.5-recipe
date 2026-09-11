@@ -209,7 +209,17 @@ def make_inputs(batch: int, seed: int) -> dict[str, torch.Tensor]:
 
 def run_correctness(batch: int, seed: int) -> dict[str, object]:
     values = make_inputs(batch, seed)
-    output_gradient = torch.randn_like(values["query"]).transpose(1, 2) * 0.03
+    output_gradient = (
+        torch.randn(
+            batch,
+            _SEQUENCE_LENGTH,
+            _QUERY_HEADS,
+            _HEAD_DIM,
+            device=values["query"].device,
+            dtype=values["query"].dtype,
+        )
+        * 0.03
+    )
     candidate_inputs = tuple(
         values[name].clone().requires_grad_()
         for name in ("query", "local_kv", "compressed_kv", "sink")
@@ -324,7 +334,14 @@ def run_benchmark(
     sink = values["sink"].requires_grad_()
     compressor_kv = values["compressor_kv"].requires_grad_()
     compressor_gate = values["compressor_gate"].requires_grad_()
-    output_gradient = torch.randn_like(query).transpose(1, 2)
+    output_gradient = torch.randn(
+        batch,
+        _SEQUENCE_LENGTH,
+        _QUERY_HEADS,
+        _HEAD_DIM,
+        device=query.device,
+        dtype=query.dtype,
+    )
 
     def forward_only() -> None:
         with torch.no_grad():
