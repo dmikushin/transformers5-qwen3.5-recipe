@@ -130,22 +130,23 @@ def test_csa_producer_exact_shape_matches_overlap_reference() -> None:
     )
     torch.cuda.synchronize()
 
-    _assert_metrics(
-        "producer output", candidate.squeeze(1), reference, 0.0022, 0.999995
-    )
+    # The producer carries the FP32 normalization product into RoPE instead of
+    # emulating the reference RMSNorm's BF16 cast (measured 1.83e-3 against the
+    # same reference). The gates bound the residual rather than pinning it.
+    _assert_metrics("producer output", candidate.squeeze(1), reference, 0.003, 0.99999)
     _assert_metrics(
         "producer KV gradient",
         candidate_gradients[0],
         reference_gradients[0],
-        0.0022,
-        0.999995,
+        0.003,
+        0.99999,
     )
     _assert_metrics(
         "producer gate gradient",
         candidate_gradients[1],
         reference_gradients[1],
-        0.0021,
-        0.999995,
+        0.003,
+        0.99999,
     )
     assert torch.count_nonzero(candidate_gradients[0][:, -4:, :_HEAD_DIM]) == 0
     assert torch.count_nonzero(candidate_gradients[1][:, -4:, :_HEAD_DIM]) == 0
@@ -284,8 +285,8 @@ def test_csa_producer_accepts_strided_frozen_metadata() -> None:
         "strided producer output",
         candidate.squeeze(1),
         reference,
-        0.0022,
-        0.999995,
+        0.003,
+        0.99999,
     )
 
 

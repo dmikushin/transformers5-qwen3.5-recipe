@@ -21,7 +21,7 @@ def validate_deepseek_v4_routes(
             f"DeepSeek V4 routes must both have shape {expected}, got "
             f"{tuple(top_k_index.shape)} and {tuple(top_k_weights.shape)}."
         )
-    if top_k_index.dtype != torch.long:
+    if top_k_index.dtype != torch.int64:
         raise TypeError(
             f"DeepSeek V4 expert indices must be int64, got {top_k_index.dtype}."
         )

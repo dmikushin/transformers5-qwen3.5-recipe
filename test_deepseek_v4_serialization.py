@@ -7,14 +7,14 @@ from peft.utils.save_and_load import (
     get_peft_model_state_dict,
     set_peft_model_state_dict,
 )
-from transformers.integrations.gguf import DeepseekV4GGUFExperts
+from transformers.integrations.gguf.moe import DeepseekV4GgufExperts
 
 from deepseek_v4_lora import (
     DEEPSEEK_V4_TARGET_MODULES_PATTERN,
     register_deepseek_v4_lora,
 )
 from deepseek_v4_moe_lora import (
-    DeepseekV4GGUFMoeLora,
+    DeepseekV4GgufMoeLora,
     register_deepseek_v4_moe_lora,
 )
 
@@ -33,7 +33,7 @@ class _ToyDeepseek(torch.nn.Module):
             swiglu_limit=7.0,
             _experts_implementation="eager",
         )
-        self.experts = DeepseekV4GGUFExperts(
+        self.experts = DeepseekV4GgufExperts(
             config,
             device="cuda",
             compute_dtype=torch.bfloat16,
@@ -76,7 +76,7 @@ def test_module_prior_overrides_registration_fallback() -> None:
     expert_wrapper = next(
         module
         for module in wrapped.modules()
-        if isinstance(module, DeepseekV4GGUFMoeLora)
+        if isinstance(module, DeepseekV4GgufMoeLora)
     )
     assert expert_wrapper._expert_prior == "deepseek-hash"
 
@@ -112,7 +112,7 @@ def test_adapter_state_round_trip_contains_only_all_six_lora_factors() -> None:
     expert_wrapper = next(
         module
         for module in target.modules()
-        if isinstance(module, DeepseekV4GGUFMoeLora)
+        if isinstance(module, DeepseekV4GgufMoeLora)
     )
     with pytest.raises(RuntimeError, match="cannot be merged"):
         expert_wrapper.merge()

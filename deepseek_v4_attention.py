@@ -3,7 +3,7 @@ import types
 from typing import Any, cast
 
 import torch
-from transformers.masking_utils import ALL_MASK_ATTENTION_FUNCTIONS, eager_mask
+from transformers.masking_utils import ALL_MASK_ATTENTION_FUNCTIONS
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 from transformers.models.deepseek_v4.configuration_deepseek_v4 import (
     DeepseekV4Config,
@@ -49,11 +49,20 @@ def _canonical_training_mask(
     device: torch.device | str = "cpu",
     **kwargs: Any,
 ) -> torch.Tensor:
-    """Build one canonical mask and broadcast it across the physical batch.
+    """Return the mask view the family-owned kernels expect, with no mask data.
 
-    The model input hook has already rejected padding, caches, and noncanonical
-    positions. Compressed families validate this metadata but do not read it in
-    their family-owned kernels. Sliding attention ignores it.
+    No family-owned kernel reads a mask value: sliding attention ignores its mask
+    argument, and the compressed families only check this view's shape. Building
+    a real ``[1, 1, S, S]`` mask therefore costs an allocation and a device
+    synchronization per step - transformers' eager mask creates its zero scalar
+    on the device - to produce data nothing consumes. The canonical object is
+    instead one poisoned element broadcast to the expected shape, so the
+    metadata stays checkable while an accidental future read yields NaN instead
+    of a mask that silently looks plausible.
+
+    ``mask_function`` and the interface keyword arguments are accepted and
+    unused. The remaining checks still reject padding, cache offsets, and any
+    batch or sequence length the fixed-shape kernels do not support.
     """
 
     if batch_size not in _SUPPORTED_BATCHES:
@@ -76,25 +85,15 @@ def _canonical_training_mask(
     if mask_function is None:
         raise ValueError("DeepSeek V4 attention requires a canonical mask function")
 
-    # The mask is batch-independent after the input hook proves no padding.
-    # Keep one physical [1,1,S,S] tensor as the canonical proof. Family-owned
-    # kernels validate its view metadata without reading the mask data.
-    base_mask = eager_mask(
-        batch_size=1,
-        q_length=q_length,
-        kv_length=kv_length,
-        q_offset=q_offset,
-        kv_offset=kv_offset,
-        mask_function=mask_function,
-        attention_mask=None,
-        dtype=dtype,
-        device=device,
-        **kwargs,
+    # `expand` cannot infer the leading sizes from a one-element base, so the
+    # canonical shape is spelled out. The block dimension stays 1, as the input
+    # hook has already proven the batch shares one mask.
+    return torch.full((1, 1, 1, 1), float("nan"), device=device, dtype=dtype).expand(
+        batch_size, 1, q_length, kv_length
     )
-    return base_mask.expand(batch_size, -1, -1, -1)
 
 
-def _same_tensor_view(left: torch.Tensor, right: torch.Tensor) -> bool:
+def _same_tensor_view(left: torch.Tensor, right: torch.Tensor) -> bool | torch.SymBool:
     return (
         left.device == right.device
         and left.dtype == right.dtype
@@ -355,7 +354,7 @@ def _validate_model_inputs(
     batch, sequence_length = inputs.shape[:2]
     if batch not in _SUPPORTED_BATCHES or sequence_length != _SEQUENCE_LENGTH:
         raise ValueError(
-            "DeepSeek V4 fixed attention requires B in {1,4,16} and S=2048; "
+            "DeepSeek V4 fixed attention requires B in {1,4,16} and S=2048, "
             f"got B={batch}, S={sequence_length}"
         )
     if values.get("past_key_values") is not None or bool(

@@ -311,7 +311,9 @@ def test_attention_dispatch_uses_sliding_kernel_without_layout_copies() -> None:
     assert torch.equal(dispatched, direct)
 
 
-def test_canonical_mask_has_one_physical_batch() -> None:
+def test_canonical_mask_carries_no_materialized_data() -> None:
+    """The mask is only ever shape-checked, so it holds one poisoned element."""
+
     mask = _canonical_training_mask(
         batch_size=4,
         q_length=_SEQUENCE_LENGTH,
@@ -323,7 +325,11 @@ def test_canonical_mask_has_one_physical_batch() -> None:
     )
     assert mask.shape == (4, 1, _SEQUENCE_LENGTH, _SEQUENCE_LENGTH)
     assert mask.stride(0) == 0
-    assert mask.untyped_storage().nbytes() == 2 * _SEQUENCE_LENGTH**2
+    # One BF16 element backs the whole view, and reading it is deliberately loud:
+    # no family-owned kernel consumes the mask, so a future consumer that does has
+    # to notice instead of silently attending everywhere.
+    assert mask.untyped_storage().nbytes() == 2
+    assert bool(torch.isnan(mask[0, 0, 0, 0]))
 
 
 def test_model_input_guard_rejects_noncanonical_shape() -> None:
@@ -331,7 +337,7 @@ def test_model_input_guard_rejects_noncanonical_shape() -> None:
         _validate_model_inputs(
             cast(Any, None),
             (),
-            {"input_ids": torch.zeros(1, 1024, device="cuda", dtype=torch.long)},
+            {"input_ids": torch.zeros(1, 1024, device="cuda", dtype=torch.int64)},
         )
 
 

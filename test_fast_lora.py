@@ -8,13 +8,13 @@ import torch
 import torch_ggml_ops
 from peft import LoraConfig, get_peft_model
 from torch.utils._python_dispatch import TorchDispatchMode
-from transformers.integrations.gguf import GGUFLinear
-from transformers.integrations.gguf_dequant import (
-    GGUFQuantizedTensor,
-    dequantize_gguf_tensor,
+from transformers.integrations.gguf.gguf_quantized_parameter import (
+    GgufQuantizedParameter,
 )
+from transformers.integrations.gguf.modules import GgufLinear
 
-from fast_lora import FastGGUFLoraLinear, register_fast_lora
+from fast_lora import FastGgufLoraLinear, register_fast_lora
+from gguf_support import dequantize_gguf_tensor
 
 _MODEL = Path(
     os.environ.get(
@@ -40,7 +40,7 @@ def test_fast_lora_keeps_original_bf16_input_and_exact_base_jacobian() -> None:
     payload = torch.from_numpy(
         np.array(tensor.data[:out_features], dtype=np.uint8, copy=True, order="C")
     ).to("cuda")
-    packed = GGUFQuantizedTensor(
+    packed = GgufQuantizedParameter(
         payload,
         quant_type=tensor.tensor_type,
         logical_shape=(out_features, 2048),
@@ -49,7 +49,7 @@ def test_fast_lora_keeps_original_bf16_input_and_exact_base_jacobian() -> None:
     class Toy(torch.nn.Module):
         def __init__(self) -> None:
             super().__init__()
-            self.proj = GGUFLinear(
+            self.proj = GgufLinear(
                 2048,
                 out_features,
                 bias=False,
@@ -72,7 +72,7 @@ def test_fast_lora_keeps_original_bf16_input_and_exact_base_jacobian() -> None:
     register_fast_lora(config)
     model = get_peft_model(Toy(), config, autocast_adapter_dtype=False)
     layer = model.base_model.model.proj
-    assert isinstance(layer, FastGGUFLoraLinear)
+    assert isinstance(layer, FastGgufLoraLinear)
     assert layer.lora_A["default"].weight.dtype == torch.bfloat16
     assert layer.lora_B["default"].weight.dtype == torch.bfloat16
 

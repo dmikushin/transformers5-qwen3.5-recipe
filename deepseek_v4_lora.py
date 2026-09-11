@@ -5,10 +5,12 @@ from typing import Any
 import torch
 from peft import LoraConfig
 from torch_ggml_ops import fixed_grouped_mmq
-from transformers.integrations.gguf import GGUFGroupedLinear, GGUFLinear
-from transformers.integrations.gguf_dequant import GGUFQuantizedTensor
+from transformers.integrations.gguf.gguf_quantized_parameter import (
+    GgufQuantizedParameter,
+)
+from transformers.integrations.gguf.modules import GgufGroupedLinear, GgufLinear
 
-from fast_lora import FastGGUFLoraLinear, FastLoraLinear
+from fast_lora import FastGgufLoraLinear, FastLoraLinear
 
 ORDINARY_TARGET_MODULES = frozenset(
     {
@@ -53,15 +55,15 @@ class DeepseekV4LoraLinear(FastLoraLinear):
     """DeepSeek-owned wrapper for ordinary floating linear modules."""
 
 
-class DeepseekV4GGUFLoraLinear(FastGGUFLoraLinear):
+class DeepseekV4GgufLoraLinear(FastGgufLoraLinear):
     """DeepSeek-owned wrapper with capability-based packed base dispatch."""
 
 
-class _RejectedDeepseekV4GroupedLora(DeepseekV4GGUFLoraLinear):
+class _RejectedDeepseekV4GroupedLora(DeepseekV4GgufLoraLinear):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         del args, kwargs
         raise RuntimeError(
-            "DeepSeek V4 grouped o_a_proj LoRA is unsupported; keep GGUFGroupedLinear frozen."
+            "DeepSeek V4 grouped o_a_proj LoRA is unsupported. Keep GgufGroupedLinear frozen."
         )
 
 
@@ -80,8 +82,8 @@ def register_deepseek_v4_lora(lora_config: LoraConfig) -> LoraConfig:
         )
     register(
         {
-            GGUFGroupedLinear: _RejectedDeepseekV4GroupedLora,
-            GGUFLinear: DeepseekV4GGUFLoraLinear,
+            GgufGroupedLinear: _RejectedDeepseekV4GroupedLora,
+            GgufLinear: DeepseekV4GgufLoraLinear,
             torch.nn.Linear: DeepseekV4LoraLinear,
         }
     )
@@ -89,13 +91,13 @@ def register_deepseek_v4_lora(lora_config: LoraConfig) -> LoraConfig:
 
 
 def _deepseek_v4_fixed_grouped_mmq_forward(
-    self: GGUFGroupedLinear, input: torch.Tensor
+    self: GgufGroupedLinear, input: torch.Tensor
 ) -> torch.Tensor:
     """Run DeepSeek's frozen eight-group Q8_0 output-A projection natively.
 
-    ``GGUFGroupedLinear`` exposes a public ``[... , 8, 4096] -> [..., 8,
+    ``GgufGroupedLinear`` exposes a public ``[... , 8, 4096] -> [..., 8,
     1024]`` projection while its packed parameter is a flattened physical
-    ``[8192, 4352]`` payload. Flattening it through ``GGUFLinear`` would lose
+    ``[8192, 4352]`` payload. Flattening it through ``GgufLinear`` would lose
     the group boundary and the stock Transformers autograd path materializes
     the whole logical matrix. The fixed grouped operator owns that layout.
     """
@@ -109,8 +111,7 @@ def _deepseek_v4_fixed_grouped_mmq_forward(
         )
 
     compute_input = input.to(self.compute_dtype)
-    if not compute_input.is_contiguous() or compute_input.storage_offset() != 0:
-        compute_input = compute_input.contiguous()
+    compute_input = compute_input.contiguous()
     group_out_features = self.out_features // self.n_groups
     payload = self.weight.as_subclass(torch.Tensor)
     expected_payload_rows = self.n_groups * group_out_features
@@ -127,7 +128,7 @@ def _deepseek_v4_fixed_grouped_mmq_forward(
 def configure_deepseek_v4_grouped_mmq(model: torch.nn.Module) -> dict[str, Any]:
     """Install the native fixed-grouped Q8_0 path on one model instance.
 
-    The modules deliberately remain ordinary frozen ``GGUFGroupedLinear``
+    The modules deliberately remain ordinary frozen ``GgufGroupedLinear``
     instances: no PEFT wrapper or grouped ``o_a_proj`` adapter is created.
     This hardcoded DeepSeek integration fails closed instead of retaining the
     logical grouped fallback when the checkpoint contract does not match.
@@ -137,9 +138,9 @@ def configure_deepseek_v4_grouped_mmq(model: torch.nn.Module) -> dict[str, Any]:
     base = get_base_model() if callable(get_base_model) else model
     paths: list[str] = []
     for name, module in base.named_modules():
-        if not isinstance(module, GGUFGroupedLinear):
+        if not isinstance(module, GgufGroupedLinear):
             continue
-        if not isinstance(module.weight, GGUFQuantizedTensor):
+        if not isinstance(module.weight, GgufQuantizedParameter):
             raise TypeError(
                 f"DeepSeek grouped projection {name!r} is not GGUF-quantized."
             )
@@ -183,7 +184,7 @@ def audit_deepseek_v4_injection(
 ) -> dict[str, Any]:
     """Validate the complete intended adapter surface before training."""
 
-    ordinary_types = (DeepseekV4LoraLinear, DeepseekV4GGUFLoraLinear)
+    ordinary_types = (DeepseekV4LoraLinear, DeepseekV4GgufLoraLinear)
     ordinary_paths = [
         normalize_peft_path(name)
         for name, module in model.named_modules()
@@ -198,7 +199,7 @@ def audit_deepseek_v4_injection(
     grouped_paths = [
         normalize_peft_path(name)
         for name, module in model.named_modules()
-        if isinstance(module, GGUFGroupedLinear)
+        if isinstance(module, GgufGroupedLinear)
     ]
     trainable = [
         (name, parameter)
@@ -243,12 +244,12 @@ def audit_deepseek_v4_injection(
     grouped_trainable = [
         path
         for path, module in model.named_modules()
-        if isinstance(module, GGUFGroupedLinear) and module.weight.requires_grad
+        if isinstance(module, GgufGroupedLinear) and module.weight.requires_grad
     ]
     packed_trainable = [
         name
         for name, parameter in model.named_parameters()
-        if isinstance(parameter, GGUFQuantizedTensor) and parameter.requires_grad
+        if isinstance(parameter, GgufQuantizedParameter) and parameter.requires_grad
     ]
     if invalid_trainable:
         errors.append(f"non-adapter trainable tensors: {invalid_trainable[:8]}")
@@ -281,7 +282,7 @@ def audit_deepseek_v4_injection(
         "expert_target_paths": sorted(expert_paths),
         "grouped_output_paths": sorted(grouped_paths),
         "packed_parameters": sum(
-            isinstance(parameter, GGUFQuantizedTensor)
+            isinstance(parameter, GgufQuantizedParameter)
             for parameter in model.parameters()
         ),
     }

@@ -249,6 +249,8 @@ Accepted routing medians are:
 
 The path preserves learned-router sqrt-softplus scoring, correction bias, hash routing, tie-aware thresholds, selected order, FP32 weighted accumulation, direct inverse permutation, and custom gather/combine backward.
 
+Router projections use a normal BF16 `F.linear` (FP32 internal accumulation) whose BF16 result is upcast exactly to FP32. The upcast keeps the score function, the FP32-strict `e_score_correction_bias`, selection, and weight normalization in FP32, while the BF16 output rounding matches the stock Transformers routers. The fused FP32-output GEMM was rejected because hipBLASLt selects a roughly 2x slower tile at the production geometry (measured `12.16 ms` versus `5.88 ms` at B16 on gfx1151).
+
 ## Completed optimizations
 
 ### Packed model execution

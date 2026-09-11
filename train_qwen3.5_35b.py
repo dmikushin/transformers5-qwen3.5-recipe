@@ -48,7 +48,6 @@ def fixed_length_lm_collator(examples):
 def main():
     model_dir = Path.home() / "models/qwen3.6"
     gguf_file = "Qwen3.6-35B-A3B-APEX-I-Mini.gguf"
-    tokenizer_id = "Qwen/Qwen3.5-35B-A3B"
     dataset_dir = script_dir / "data_tokenized_qwen3.5"
     output_dir = script_dir / "out_qwen36_35b"
     random_seed = 19260817
@@ -59,7 +58,14 @@ def main():
     configure_qwen35_flash_attention_2()
     configure_qwen35_fla()
 
-    tokenizer = cast(Any, AutoTokenizer.from_pretrained(tokenizer_id))
+    tokenizer = cast(
+        Any,
+        AutoTokenizer.from_pretrained(
+            model_dir,
+            gguf_file=gguf_file,
+            local_files_only=True,
+        ),
+    )
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
 
@@ -67,6 +73,7 @@ def main():
         model_dir,
         gguf_file=gguf_file,
         gguf_mmap_policy="release",
+        local_files_only=True,
         dtype=torch.bfloat16,
         attn_implementation="flash_attention_2",
         device_map={"": "cuda:0"},

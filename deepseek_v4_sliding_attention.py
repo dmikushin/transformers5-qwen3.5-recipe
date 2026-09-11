@@ -751,7 +751,7 @@ def _validate_bshd_inputs(
     expected_kv = (batch, _SEQUENCE_LENGTH, _KV_HEADS, _HEAD_DIM)
     if batch not in _SUPPORTED_BATCHES:
         raise ValueError(
-            f"unsupported DeepSeek V4 sliding-attention batch {batch}; "
+            f"unsupported DeepSeek V4 sliding-attention batch {batch}, "
             f"expected one of {sorted(_SUPPORTED_BATCHES)}"
         )
     if tuple(query.shape) != expected_query:
@@ -789,17 +789,14 @@ class _DeepseekV4SlidingAttentionFunction(torch.autograd.Function):
         sink: torch.Tensor,
     ) -> torch.Tensor:
         output, softmax_lse, scores = _sliding_forward(query, shared_kv, sink)
-        ctx.set_materialize_grads(False)
         ctx.save_for_backward(query, shared_kv, output, softmax_lse, sink, scores)
         return output
 
     @staticmethod
     def backward(  # ty: ignore[invalid-method-override]
         ctx: Any,
-        grad_output: torch.Tensor | None,
-    ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
-        if grad_output is None:
-            return None, None, None
+        grad_output: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         query, shared_kv, output, softmax_lse, sink, scores = ctx.saved_tensors
         if grad_output.dtype != torch.bfloat16:
             raise TypeError(

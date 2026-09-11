@@ -1,9 +1,11 @@
 from typing import Any, cast
 
 import torch
-from transformers.integrations import gguf_dequant_kernels
+from transformers.integrations.gguf import dequant as gguf_dequant
+from transformers.integrations.gguf import gguf_quantized_parameter
+from transformers.integrations.gguf import kernels as gguf_kernels
 
-_PATCH_MARKER = "_no_unsloth_torch_compile_patch"
+_PATCH_MARKER = "_torch_compile_patch"
 _RECOMPILE_LIMIT = 64
 
 
@@ -17,10 +19,10 @@ def configure_compiled_gguf_dequantize() -> bool:
     """
     torch._dynamo.config.__dict__["recompile_limit"] = _RECOMPILE_LIMIT
 
-    if getattr(gguf_dequant_kernels, _PATCH_MARKER, False):
+    if getattr(gguf_dequant, _PATCH_MARKER, False):
         return False
 
-    eager_dequantize = gguf_dequant_kernels.dequantize
+    eager_dequantize = gguf_dequant.dequantize
     compile_fn = cast(Any, torch.compile)
     compiled_dequantize = compile_fn(
         eager_dequantize,
@@ -28,7 +30,12 @@ def configure_compiled_gguf_dequantize() -> bool:
         mode="max-autotune-no-cudagraphs",
         recompile_limit=_RECOMPILE_LIMIT,
     )
-    compiled_dequantize._no_unsloth_eager_dequantize = eager_dequantize
-    gguf_dequant_kernels.dequantize = compiled_dequantize
-    gguf_dequant_kernels.__dict__[_PATCH_MARKER] = True
+    compiled_dequantize._eager_dequantize = eager_dequantize
+    # Both consumers import the function into their module namespace. Replacing
+    # only gguf.dequant.dequantize would leave persistent parameters and the
+    # kernel fallback bound to the eager function imported at module load time.
+    gguf_dequant.dequantize = compiled_dequantize
+    gguf_quantized_parameter.dequantize = compiled_dequantize
+    gguf_kernels.dequantize = compiled_dequantize
+    gguf_dequant.__dict__[_PATCH_MARKER] = True
     return True

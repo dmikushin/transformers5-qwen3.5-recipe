@@ -5,10 +5,12 @@ Gate and up share one dynamic Q8_1 activation workspace. Frozen base input
 gradients decode active packed experts directly into BF16 WMMA fragments.
 Gate and up accumulate into one FP32 route-gradient accumulator. Rank-small
 LoRA branches retain AITER ``gmm`` and factor gradients retain AITER ``ptgmm``.
+The gate/up factor rebuilds its routed rows from the routing index in backward
+instead of retaining the gathered activation.
 No logical base matrix, full expert LoRA delta, or effective expert-weight
 gradient is constructed.
 
-PEFT targets each complete ``GGUFExperts`` module rather than its packed
+PEFT targets each complete ``GgufExperts`` module rather than its packed
 physical parameters. One wrapper owns the combined gate/up and down factors,
 which keeps the Qwen3.5 shared-A gate/up LoRA semantics while avoiding nested
 parameter wrappers and transient state on the expert module.
@@ -23,8 +25,10 @@ from aiter.ops.triton.gmm import gmm, ptgmm
 from peft import LoraConfig
 from peft.tuners.lora.layer import LoraLayer
 from torch_ggml_ops import grouped_mmq, grouped_mmq_pair
-from transformers.integrations.gguf import ALL_GGUF_EXPERTS_FUNCTIONS, GGUFExperts
-from transformers.integrations.gguf_dequant import GGUFQuantizedTensor
+from transformers.integrations.gguf.gguf_quantized_parameter import (
+    GgufQuantizedParameter,
+)
+from transformers.integrations.gguf.moe import ALL_GGUF_EXPERTS_FUNCTIONS, GgufExperts
 
 from fast_moe_routing import finalize_expert_routing, prepare_expert_routing
 from moe_gmm_configs import gmm_config as _gmm_config
@@ -32,7 +36,7 @@ from moe_gmm_configs import ptgmm_config as _ptgmm_config
 
 EXPERTS_IMPLEMENTATION = "qwen3_5_moe_gguf_mmq_aiter_lora"
 _LORA_WEIGHTS_KWARG = "_qwen3_5_moe_gguf_lora_weights"
-_GGUF_EXPERTS_TYPE = cast(type[Any], GGUFExperts)
+_GGUF_EXPERTS_TYPE = cast(type[Any], GgufExperts)
 
 
 def _aiter_forward(
@@ -102,7 +106,15 @@ def _aiter_weight_grad(
 
 
 class _AiterGroupedMM(torch.autograd.Function):
-    """Autograd-capable ``(M,K) @ (E,K,N)`` grouped matrix multiplication."""
+    """Autograd-capable ``(M,K) @ (E,K,N)`` grouped matrix multiplication.
+
+    ``lhs`` may be rebuilt instead of retained. When ``lhs_source`` and
+    ``lhs_permutation`` are supplied they satisfy
+    ``lhs == lhs_source[lhs_permutation // lhs_top_k]``, so the source rows plus
+    the index are saved and the gather is replayed in backward. Routing repeats
+    every token ``top_k`` times, which makes the gathered activation several
+    times larger than the token rows it copies. The replay is bitwise identical.
+    """
 
     @staticmethod
     def forward(
@@ -111,6 +123,9 @@ class _AiterGroupedMM(torch.autograd.Function):
         rhs: torch.Tensor,
         group_sizes: torch.Tensor,
         expert_prior: str,
+        lhs_source: torch.Tensor | None,
+        lhs_permutation: torch.Tensor | None,
+        lhs_top_k: int,
     ) -> torch.Tensor:
         if lhs.ndim != 2 or rhs.ndim != 3 or group_sizes.ndim != 1:
             raise ValueError(
@@ -135,13 +150,50 @@ class _AiterGroupedMM(torch.autograd.Function):
             raise ValueError("AITER grouped MM group_sizes must share the lhs device.")
         if group_sizes.dtype != torch.int32 or group_sizes.stride() != (1,):
             raise ValueError("AITER grouped MM group_sizes must be contiguous int32.")
+
+        rebuild_lhs = lhs_source is not None
+        if rebuild_lhs:
+            if lhs_permutation is None:
+                raise ValueError(
+                    "Grouped-MM lhs rebuild requires the routing permutation."
+                )
+            if lhs_top_k < 1:
+                raise ValueError(
+                    f"Grouped-MM lhs rebuild requires top_k >= 1, got {lhs_top_k}."
+                )
+            if (
+                lhs_source.ndim != 2
+                or lhs_source.dtype != lhs.dtype
+                or lhs_source.shape[1] != lhs.shape[1]
+                or lhs_source.stride() != (lhs_source.shape[1], 1)
+            ):
+                raise ValueError(
+                    "Grouped-MM lhs rebuild requires a row-major source whose features "
+                    "match lhs."
+                )
+            if (
+                lhs_permutation.ndim != 1
+                or lhs_permutation.numel() != lhs.shape[0]
+                or lhs_permutation.dtype not in (torch.int32, torch.int64)
+            ):
+                raise ValueError(
+                    "Grouped-MM lhs rebuild requires one row index per lhs row."
+                )
+
         ctx.expert_prior = expert_prior
-        ctx.save_for_backward(lhs, rhs, group_sizes)
+        ctx.rebuild_lhs = rebuild_lhs
+        ctx.lhs_top_k = lhs_top_k
+        ctx.save_for_backward(
+            rhs,
+            group_sizes,
+            lhs_source if rebuild_lhs else lhs,
+            lhs_permutation,
+        )
         return _aiter_forward(lhs, rhs, group_sizes, expert_prior=ctx.expert_prior)
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):  # ty: ignore[invalid-method-override]
-        lhs, rhs, group_sizes = ctx.saved_tensors
+        rhs, group_sizes, lhs_or_source, lhs_permutation = ctx.saved_tensors
         if grad_output.stride() != (grad_output.shape[1], 1):
             raise ValueError("AITER grouped MM output gradient must be row-major.")
         grad_lhs = (
@@ -151,17 +203,25 @@ class _AiterGroupedMM(torch.autograd.Function):
             if ctx.needs_input_grad[0]
             else None
         )
-        grad_rhs = (
-            _aiter_weight_grad(
+        grad_rhs = None
+        if ctx.needs_input_grad[1]:
+            if ctx.rebuild_lhs:
+                if lhs_permutation is None:
+                    raise RuntimeError(
+                        "Grouped-MM lhs rebuild lost its routing permutation."
+                    )
+                # `detach` keeps the replay a value-level substitute for a saved
+                # tensor. It must not add a second path to the source gradient.
+                lhs = lhs_or_source.detach()[lhs_permutation // ctx.lhs_top_k]
+            else:
+                lhs = lhs_or_source
+            grad_rhs = _aiter_weight_grad(
                 lhs,
                 grad_output,
                 group_sizes,
                 expert_prior=ctx.expert_prior,
             )
-            if ctx.needs_input_grad[1]
-            else None
-        )
-        return grad_lhs, grad_rhs, None, None
+        return grad_lhs, grad_rhs, None, None, None, None, None
 
 
 def aiter_grouped_mm(
@@ -170,10 +230,25 @@ def aiter_grouped_mm(
     group_sizes: torch.Tensor,
     *,
     expert_prior: str,
+    lhs_source: torch.Tensor | None = None,
+    lhs_permutation: torch.Tensor | None = None,
+    lhs_top_k: int = 1,
 ) -> torch.Tensor:
-    """Apply the autograd-capable AITER grouped matrix multiplication."""
+    """Apply the autograd-capable AITER grouped matrix multiplication.
 
-    return _AiterGroupedMM.apply(lhs, rhs, group_sizes, expert_prior)
+    ``lhs_source``/``lhs_permutation``/``lhs_top_k`` optionally describe ``lhs``
+    as a routed row gather, so backward replays the gather instead of holding it.
+    """
+
+    return _AiterGroupedMM.apply(
+        lhs,
+        rhs,
+        group_sizes,
+        expert_prior,
+        lhs_source,
+        lhs_permutation,
+        lhs_top_k,
+    )
 
 
 def _native_grouped_arguments(
@@ -186,7 +261,7 @@ def _native_grouped_arguments(
         raise RuntimeError("Grouped GGUF MMQ requires BF16 compute dtype.")
     hidden_states = hidden_states.to(compute_dtype).contiguous()
     expert_indices = expert_indices.to(
-        device=hidden_states.device, dtype=torch.long
+        device=hidden_states.device, dtype=torch.int64
     ).contiguous()
     expert_offsets = expert_offsets.to(
         device=hidden_states.device, dtype=torch.int32
@@ -203,7 +278,7 @@ def _base_grouped_linear(
     compute_dtype: torch.dtype,
 ) -> torch.Tensor:
     del group_sizes
-    if not isinstance(weight, GGUFQuantizedTensor):
+    if not isinstance(weight, GgufQuantizedParameter):
         raise TypeError(
             "Fast MoE base projections require packed GGUF weights and the "
             "exported torch_ggml_ops grouped_mmq API."
@@ -236,8 +311,8 @@ def _base_grouped_pair(
     group_sizes: torch.Tensor,
     compute_dtype: torch.dtype,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if not isinstance(first_weight, GGUFQuantizedTensor) or not isinstance(
-        second_weight, GGUFQuantizedTensor
+    if not isinstance(first_weight, GgufQuantizedParameter) or not isinstance(
+        second_weight, GgufQuantizedParameter
     ):
         raise TypeError("Fast MoE paired base projections require packed GGUF weights.")
     if (
@@ -302,8 +377,36 @@ class _ExpertLoraWeights:
     expert_prior: str
 
 
-class FastGGUFMoeLora(torch.nn.Module, LoraLayer):
-    """PEFT LoRA wrapper owning all factors for one packed ``GGUFExperts`` module."""
+def _prepare_packed_expert_execution(
+    routing_plan: Any,
+    num_experts: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return expert IDs, int32 offsets, and int32 group sizes for every expert.
+
+    `routing_plan.expert_indices` holds one sorted expert id per routed row, so
+    the per-expert row counts are a scatter-add into a fixed-size tensor and the
+    offsets a prefix sum over it. Covering every expert keeps all three tensors a
+    fixed length, which is what lets the routed row counts stay on the device:
+    `torch.unique_consecutive` sizes its output on the host and synchronized once
+    per MoE layer. Emptied groups are inert in the grouped kernels, which accept
+    `num_groups <= num_experts` and drop any group whose row range is empty.
+    """
+
+    device = routing_plan.expert_indices.device
+    expert_ids = torch.arange(num_experts, device=device, dtype=torch.int64)
+    group_sizes = torch.zeros(num_experts, device=device, dtype=torch.int32)
+    group_sizes.index_add_(
+        0,
+        routing_plan.expert_indices,
+        torch.ones_like(routing_plan.expert_indices, dtype=torch.int32),
+    )
+    # cumsum promotes integral inputs to int64 unless told otherwise, and the
+    # grouped kernels require int32 offsets.
+    return expert_ids, group_sizes.cumsum(0, dtype=torch.int32), group_sizes
+
+
+class FastGgufMoeLora(torch.nn.Module, LoraLayer):
+    """PEFT LoRA wrapper owning all factors for one packed ``GgufExperts`` module."""
 
     adapter_layer_names = ("lora_A", "lora_B", "lora_A_down", "lora_B_down")
 
@@ -311,7 +414,7 @@ class FastGGUFMoeLora(torch.nn.Module, LoraLayer):
         module = module.get_base_layer() if isinstance(module, LoraLayer) else module
         if not isinstance(module, _GGUF_EXPERTS_TYPE):
             raise TypeError(
-                f"Fast GGUF MoE LoRA requires GGUFExperts, got {type(module).__name__}."
+                f"Fast GGUF MoE LoRA requires GgufExperts, got {type(module).__name__}."
             )
         module = cast(Any, module)
         return int(module.hidden_dim), 2 * int(module.intermediate_dim)
@@ -366,7 +469,7 @@ class FastGGUFMoeLora(torch.nn.Module, LoraLayer):
         experts = cast(Any, self.get_base_layer())
         if not isinstance(experts, _GGUF_EXPERTS_TYPE):
             raise TypeError(
-                f"Fast GGUF MoE LoRA requires GGUFExperts, got {type(experts).__name__}."
+                f"Fast GGUF MoE LoRA requires GgufExperts, got {type(experts).__name__}."
             )
         device = cast(torch.device, experts.gate_proj.device)
         dtype = cast(torch.dtype, experts.compute_dtype)
@@ -477,30 +580,7 @@ class FastGGUFMoeLora(torch.nn.Module, LoraLayer):
         return self.base_layer(hidden_states, *args, **kwargs)
 
 
-FastMoeParamWrapper = FastGGUFMoeLora
-
-
-def _group_sizes_from_offsets(offsets: torch.Tensor) -> torch.Tensor:
-    if offsets.ndim != 1:
-        raise ValueError(
-            f"GGUF grouped execution requires one-dimensional offsets, got {offsets.shape}."
-        )
-    if offsets.dtype != torch.int32 or offsets.stride() != (1,):
-        raise ValueError("GGUF grouped offsets must be contiguous int32.")
-    previous = torch.cat((offsets.new_zeros(1), offsets[:-1]))
-    return offsets - previous
-
-
-def _complete_group_sizes(
-    active_group_sizes: torch.Tensor,
-    expert_indices: torch.Tensor,
-    num_experts: int,
-) -> torch.Tensor:
-    if expert_indices.numel() == num_experts:
-        return active_group_sizes
-    return active_group_sizes.new_zeros(num_experts).index_copy(
-        0, expert_indices, active_group_sizes
-    )
+FastMoeParamWrapper = FastGgufMoeLora
 
 
 def _lora_grouped_linear(
@@ -510,12 +590,25 @@ def _lora_grouped_linear(
     group_sizes: torch.Tensor,
     *,
     expert_prior: str,
+    gather_source: torch.Tensor | None = None,
+    gather_permutation: torch.Tensor | None = None,
+    gather_top_k: int = 1,
 ) -> torch.Tensor:
+    """Run both rank-small factors over the routed rows.
+
+    ``gather_source``/``gather_permutation``/``gather_top_k`` describe
+    ``hidden_states`` as routed rows of the token activations, which lets the
+    first factor rebuild them in backward instead of retaining the gather.
+    """
+
     rank_states = aiter_grouped_mm(
         hidden_states,
         lora_a.transpose(1, 2),
         group_sizes,
         expert_prior=expert_prior,
+        lhs_source=gather_source,
+        lhs_permutation=gather_permutation,
+        lhs_top_k=gather_top_k,
     )
     return aiter_grouped_mm(
         rank_states,
@@ -536,7 +629,7 @@ def qwen3_5_moe_gguf_mmq_aiter_lora_forward(
 
     if not isinstance(self, _GGUF_EXPERTS_TYPE):
         raise TypeError(
-            f"{EXPERTS_IMPLEMENTATION} requires GGUFExperts, got {type(self).__name__}."
+            f"{EXPERTS_IMPLEMENTATION} requires GgufExperts, got {type(self).__name__}."
         )
     if self.projection_layout != "split_gate_up" or self.has_bias or not self.has_gate:
         raise RuntimeError(
@@ -549,18 +642,17 @@ def qwen3_5_moe_gguf_mmq_aiter_lora_forward(
         top_k_index,
         top_k_weights,
     )
-    execution_plan = self._prepare_expert_execution(routing_plan, "grouped_mm")
-    if execution_plan.offsets is None:
-        raise RuntimeError("GGUF AITER LoRA requires grouped expert offsets.")
+    expert_indices, expert_offsets, group_sizes = _prepare_packed_expert_execution(
+        routing_plan, self.num_experts
+    )
 
     selected_hidden_states = routing_plan.selected_hidden_states
-    expert_indices = execution_plan.expert_indices.to(
-        device=selected_hidden_states.device, dtype=torch.long
+    expert_indices = expert_indices.to(
+        device=selected_hidden_states.device, dtype=torch.int64
     ).contiguous()
-    expert_offsets = execution_plan.offsets.to(
+    expert_offsets = expert_offsets.to(
         device=selected_hidden_states.device, dtype=torch.int32
     ).contiguous()
-    group_sizes = _group_sizes_from_offsets(expert_offsets)
 
     gate, up = _base_grouped_pair(
         selected_hidden_states,
@@ -574,19 +666,24 @@ def qwen3_5_moe_gguf_mmq_aiter_lora_forward(
 
     lora_weights = _qwen3_5_moe_gguf_lora_weights
     if lora_weights is not None:
-        lora_group_sizes = _complete_group_sizes(
-            group_sizes, expert_indices, self.num_experts
-        )
+        # `group_sizes` already covers every expert, so the grouped MM skips the
+        # empty groups without selecting or gathering expert factors.
         gate_up_delta = _lora_grouped_linear(
             selected_hidden_states,
             lora_weights.gate_up_a,
             lora_weights.gate_up_b,
-            lora_group_sizes,
+            group_sizes,
             expert_prior=lora_weights.expert_prior,
+            # These rows are the token activations repeated top_k times, so keep
+            # the token rows and the routing index and replay the gather in
+            # backward instead of retaining a routed-size activation.
+            gather_source=compute_hidden_states,
+            gather_permutation=routing_plan.permutation,
+            gather_top_k=routing_plan.num_top_k,
         )
         gate_delta, up_delta = gate_up_delta.chunk(2, dim=-1)
-        gate = torch.add(gate, gate_delta, alpha=lora_weights.scaling)
-        up = torch.add(up, up_delta, alpha=lora_weights.scaling)
+        gate.add_(gate_delta, alpha=lora_weights.scaling)
+        up.add_(up_delta, alpha=lora_weights.scaling)
 
     intermediate = self._apply_split_gate(gate, up)
     output = _base_grouped_linear(
@@ -602,17 +699,12 @@ def qwen3_5_moe_gguf_mmq_aiter_lora_forward(
             intermediate,
             lora_weights.down_a,
             lora_weights.down_b,
-            lora_group_sizes,
+            group_sizes,
             expert_prior=lora_weights.expert_prior,
         )
-        output = torch.add(output, down_delta, alpha=lora_weights.scaling)
+        output.add_(down_delta, alpha=lora_weights.scaling)
 
-    return finalize_expert_routing(
-        output,
-        hidden_states,
-        routing_plan,
-        execution_plan.output_mask,
-    )
+    return finalize_expert_routing(output, hidden_states, routing_plan, None)
 
 
 def register_fast_moe_lora(
@@ -651,5 +743,5 @@ def register_fast_moe_lora(
     for module in model.modules():
         if isinstance(module, _GGUF_EXPERTS_TYPE):
             module.__dict__["_aiter_expert_prior"] = expert_prior
-    register({GGUFExperts: FastGGUFMoeLora})
+    register({GgufExperts: FastGgufMoeLora})
     return lora_config

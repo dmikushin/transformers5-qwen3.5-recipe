@@ -1,11 +1,10 @@
 """Fast instance-local Liger RMSNorm integration for DeepSeek V4.
 
-Weighted DeepSeek norms have frozen FP32 scale vectors. Stock Liger computes a
-scale gradient whenever a weight tensor is supplied, regardless of
-``requires_grad``. This module reuses Liger's weighted forward and supplies an
-in-place backward that computes only the activation gradient. Q-B's scale-free
-norm uses stock Liger with ``W=None``, which already has no weight-gradient
-work.
+Weighted DeepSeek norms have frozen FP32 scale vectors. Liger's RMSNorm
+forward remains the compute path. This module supplies an in-place backward
+that computes only the activation gradient because the scale is frozen. Q-B's
+scale-free norm uses stock Liger with ``W=None``, which already has no
+weight-gradient work.
 
 Width-128 weighted norms use a narrow-geometry launch specialization. The
 mHC input norms remain strict for the dedicated norm/projection/Sinkhorn/collapse
@@ -32,6 +31,7 @@ EXPECTED_SKIPPED_WEIGHTED_128_RMSNORMS = 0
 EXPECTED_Q_B_RMSNORMS = 43
 EXPECTED_SKIPPED_MHC_RMSNORMS = 87
 _PATCH_MARKER = "_deepseek_v4_liger_rmsnorm"
+_LIGER_WEIGHTED_CASTING_MODE = "llama"
 
 
 @triton.jit
@@ -50,7 +50,7 @@ def _frozen_weight_rms_norm_backward_kernel(
     rows_per_program,
     BLOCK_SIZE: tl.constexpr,
 ):
-    """Gemma-casting RMSNorm activation gradient without ``dW``."""
+    """Liger weighted RMSNorm activation gradient without ``dW``."""
 
     row_block_id = tl.program_id(0).to(tl.int64)
     row_start = row_block_id * rows_per_program
@@ -143,7 +143,7 @@ class _LigerFrozenWeightRMSNormFunction(torch.autograd.Function):
             W,
             eps,
             0.0,
-            "gemma",
+            _LIGER_WEIGHTED_CASTING_MODE,
             True,
         )
         ctx.block_size = block_size
@@ -213,7 +213,7 @@ def configure_deepseek_v4_liger_rmsnorm(
                 continue
             if module.weight.dtype != torch.float32:
                 raise RuntimeError(
-                    "DeepSeek weighted Liger RMSNorm requires an FP32 scale vector; "
+                    "DeepSeek weighted Liger RMSNorm requires an FP32 scale vector. "
                     f"{name!r} has {module.weight.dtype}"
                 )
             module.forward = MethodType(_weighted_liger_forward, module)

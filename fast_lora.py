@@ -18,8 +18,10 @@ from peft import LoraConfig
 from peft.tuners.lora.layer import VARIANT_KWARG_KEYS
 from peft.tuners.lora.layer import Linear as PeftLinear
 from torch_ggml_ops import mmq
-from transformers.integrations.gguf import GGUFLinear
-from transformers.integrations.gguf_dequant import GGUFQuantizedTensor
+from transformers.integrations.gguf.gguf_quantized_parameter import (
+    GgufQuantizedParameter,
+)
+from transformers.integrations.gguf.modules import GgufLinear
 
 
 def _fused_lora_add(
@@ -115,8 +117,8 @@ class FastLoraLinear(_FastLoraForwardMixin, PeftLinear):
     """Drop-in PEFT LoRA wrapper for ordinary floating linear modules."""
 
 
-class FastGGUFLoraLinear(FastLoraLinear):
-    """Fast LoRA wrapper for frozen packed ``GGUFLinear`` modules.
+class FastGgufLoraLinear(FastLoraLinear):
+    """Fast LoRA wrapper for frozen packed ``GgufLinear`` modules.
 
     Unpermuted packed weights use exported dense MMQ in both directions.
     Kernel support is authoritative in ``torch-ggml-ops`` and is not probed here.
@@ -127,7 +129,7 @@ class FastGGUFLoraLinear(FastLoraLinear):
     ) -> torch.Tensor:
         base = self.base_layer
         if (
-            not isinstance(base.weight, GGUFQuantizedTensor)
+            not isinstance(base.weight, GgufQuantizedParameter)
             or base.input_permutation is not None
             or base.output_permutation is not None
         ):
@@ -180,10 +182,10 @@ def register_fast_lora(lora_config: LoraConfig) -> LoraConfig:
             "Cannot install fast LoRA without a global monkey patch."
         )
 
-    # GGUFLinear subclasses nn.Linear, so its merge-safe wrapper must be checked first.
+    # GgufLinear subclasses nn.Linear, so its merge-safe wrapper must be checked first.
     register(
         {
-            GGUFLinear: FastGGUFLoraLinear,
+            GgufLinear: FastGgufLoraLinear,
             torch.nn.Linear: FastLoraLinear,
         }
     )

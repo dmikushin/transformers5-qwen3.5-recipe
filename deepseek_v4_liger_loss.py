@@ -13,16 +13,20 @@ from typing import Any, cast
 import torch
 import triton
 from liger_kernel.ops.cross_entropy import liger_cross_entropy_kernel
-from liger_kernel.ops.fused_linear_cross_entropy import (
-    MAX_FUSED_SIZE,
-    fused_linear_cross_entropy_backward,
+from liger_kernel.ops.fused_linear_cross_entropy import MAX_FUSED_SIZE
+from liger_kernel.ops.utils import (
+    amp_custom_bwd,
+    amp_custom_fwd,
+    element_mul_kernel,
+    is_hip,
 )
-from liger_kernel.ops.utils import amp_custom_bwd, amp_custom_fwd, is_hip
 from liger_kernel.transformers.model.loss_utils import LigerForCausalLMLoss
 from torch import nn
 from torch_ggml_ops import mmq_grad_input_inplace, mmq_inplace
-from transformers.integrations.gguf import GGUFLinear
-from transformers.integrations.gguf_dequant import GGUFQuantizedTensor
+from transformers.integrations.gguf.gguf_quantized_parameter import (
+    GgufQuantizedParameter,
+)
+from transformers.integrations.gguf.modules import GgufLinear
 from transformers.modeling_outputs import MoeCausalLMOutputWithPast
 from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
     DeepseekV4ForCausalLM,
@@ -32,9 +36,31 @@ from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
 _PACKED_LM_HEAD_CHUNK_SIZE = 512
 
 
+def _scale_input_gradient_in_place(
+    grad_input: torch.Tensor, grad_output: torch.Tensor
+) -> None:
+    """Multiply a retained hidden-state gradient by the scalar loss gradient.
+
+    Liger's ``fused_linear_cross_entropy_backward`` opens with
+    ``torch.equal(grad_output, torch.tensor(1.0, ...))``, which synchronizes the
+    device on every step. That test only decides whether this multiply can be
+    skipped, so running it unconditionally is cheaper than the stall.
+    """
+
+    rows, hidden = grad_input.shape
+    element_mul_kernel[(rows,)](
+        grad_input,
+        grad_input.stride(-2),
+        grad_output,
+        hidden,
+        BLOCK_SIZE=min(MAX_FUSED_SIZE, triton.next_power_of_2(hidden)),
+        num_warps=32 if not is_hip() else 16,
+    )
+
+
 def deepseek_v4_liger_causal_lm_loss(
     hidden_states: torch.Tensor,
-    lm_head: GGUFLinear,
+    lm_head: GgufLinear,
     labels: torch.Tensor,
     *,
     hidden_size: int,
@@ -73,10 +99,13 @@ def _packed_q8_linear_cross_entropy_forward(
     ignore_index: int,
     lse_square_scale: float,
     label_smoothing: float,
-    reduction: str,
     softcap: float | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Run chunked Q8_1 MMQ, in-place Liger CE, and packed dHidden."""
+    """Run chunked Q8_1 MMQ, in-place Liger CE, and packed dHidden.
+
+    The returned loss is the un-normalized sum over rows. The caller applies the
+    mean reduction on device, so the non-ignored count never reaches the host.
+    """
 
     if input.ndim != 2:
         raise ValueError(
@@ -90,13 +119,9 @@ def _packed_q8_linear_cross_entropy_forward(
         raise ValueError(
             "Packed LM-head targets must be one-dimensional and match the hidden-state row count."
         )
-    if target.dtype != torch.long:
+    if target.dtype != torch.int64:
         raise TypeError(
-            f"Packed LM-head targets require torch.long, got {target.dtype}."
-        )
-    if reduction not in {"mean", "sum"}:
-        raise ValueError(
-            f"Packed LM-head loss supports only mean or sum reduction, got {reduction!r}."
+            f"Packed LM-head targets require torch.int64, got {target.dtype}."
         )
     if chunk_size <= 0:
         raise ValueError(
@@ -104,10 +129,6 @@ def _packed_q8_linear_cross_entropy_forward(
         )
 
     rows = input.shape[0]
-    target_mask = target != ignore_index
-    # Liger's kernel needs the total non-ignored count for each chunk. This is
-    # a scalar metadata read, not a logits or weight materialization.
-    total_n_non_ignore = target_mask.sum().item()
     block_size = min(MAX_FUSED_SIZE, triton.next_power_of_2(out_features))
 
     grad_input = torch.empty_like(input)
@@ -153,13 +174,13 @@ def _packed_q8_linear_cross_entropy_forward(
             predicted_tokens_ptr=None,
             predicted_tokens_stride=0,
             n_cols=out_features,
-            n_non_ignore=total_n_non_ignore,
-            sum_non_ignore_weight=total_n_non_ignore,
+            n_non_ignore=1,
+            sum_non_ignore_weight=1,
             weight_sum=0.0,
             ignore_index=ignore_index,
             lse_square_scale=lse_square_scale,
             label_smoothing=label_smoothing,
-            reduction=reduction,
+            reduction="sum",
             softcap=softcap,
             RETURN_Z_LOSS=False,
             RETURN_TOKEN_ACCURACY=False,
@@ -197,7 +218,6 @@ class _PackedQ8LigerLinearCrossEntropyFunction(torch.autograd.Function):
         ignore_index: int,
         lse_square_scale: float,
         label_smoothing: float,
-        reduction: str,
         softcap: float | None,
     ):
         loss, grad_input = _packed_q8_linear_cross_entropy_forward(
@@ -210,7 +230,6 @@ class _PackedQ8LigerLinearCrossEntropyFunction(torch.autograd.Function):
             ignore_index,
             lse_square_scale,
             label_smoothing,
-            reduction,
             softcap,
         )
         ctx.save_for_backward(grad_input.detach())
@@ -224,18 +243,13 @@ class _PackedQ8LigerLinearCrossEntropyFunction(torch.autograd.Function):
                 "Packed Q8_0 GGUF LM-head loss does not support higher-order gradients"
             )
         (grad_input,) = ctx.saved_tensors
-        grad_input, _, _ = fused_linear_cross_entropy_backward(
-            grad_output,
-            grad_input,
-            None,
-            None,
-        )
-        return (grad_input,) + (None,) * 10
+        _scale_input_gradient_in_place(grad_input, grad_output)
+        return (grad_input,) + (None,) * 9
 
 
 def _packed_q8_liger_for_causal_lm_loss(
     hidden_states: torch.Tensor,
-    lm_head: GGUFLinear,
+    lm_head: GgufLinear,
     labels: torch.Tensor,
     hidden_size: int,
     num_items_in_batch: int | torch.Tensor | None = None,
@@ -265,8 +279,10 @@ def _packed_q8_liger_for_causal_lm_loss(
         raise RuntimeError(
             "Packed DeepSeek Q8_0 LM-head loss supports only FP32 internal accumulation."
         )
-    if not isinstance(lm_head.weight, GGUFQuantizedTensor):
-        raise TypeError("Packed DeepSeek LM-head loss requires a GGUFQuantizedTensor.")
+    if not isinstance(lm_head.weight, GgufQuantizedParameter):
+        raise TypeError(
+            "Packed DeepSeek LM-head loss requires a GgufQuantizedParameter."
+        )
     if lm_head.input_permutation is not None or lm_head.output_permutation is not None:
         raise RuntimeError(
             "Packed DeepSeek Q8_0 LM-head loss does not support layout permutations."
@@ -293,7 +309,6 @@ def _packed_q8_liger_for_causal_lm_loss(
 
     hidden_states = hidden_states.reshape(-1, hidden_size)
     shift_labels = shift_labels.reshape(-1).to(hidden_states.device)
-    reduction = "sum" if num_items_in_batch is not None else "mean"
     payload = lm_head.weight.as_subclass(torch.Tensor)
     loss = _PackedQ8LigerLinearCrossEntropyFunction.apply(
         hidden_states,
@@ -305,17 +320,22 @@ def _packed_q8_liger_for_causal_lm_loss(
         ignore_index,
         0.0,
         0.0,
-        reduction,
         None,
     )
-    if num_items_in_batch is not None:
-        loss = loss / num_items_in_batch
-    return loss
+    # The kernel produces an un-normalized sum, and the reduction is applied here
+    # on device so the non-ignored count never round-trips through the host. As a
+    # plain tensor division it also scales the backward through autograd.
+    denominator = (
+        num_items_in_batch
+        if num_items_in_batch is not None
+        else (shift_labels != ignore_index).sum()
+    )
+    return loss / denominator
 
 
 def deepseek_v4_packed_liger_causal_lm_loss(
     hidden_states: torch.Tensor,
-    lm_head: GGUFLinear,
+    lm_head: GgufLinear,
     labels: torch.Tensor,
     *,
     hidden_size: int,
@@ -334,12 +354,12 @@ def deepseek_v4_packed_liger_causal_lm_loss(
 
 def _deepseek_v4_liger_forward(
     self: DeepseekV4ForCausalLM,
-    input_ids: torch.LongTensor | None = None,
+    input_ids: torch.Tensor | None = None,
     attention_mask: torch.Tensor | None = None,
-    position_ids: torch.LongTensor | None = None,
+    position_ids: torch.Tensor | None = None,
     past_key_values: Any | None = None,
-    inputs_embeds: torch.FloatTensor | None = None,
-    labels: torch.LongTensor | None = None,
+    inputs_embeds: torch.Tensor | None = None,
+    labels: torch.Tensor | None = None,
     use_cache: bool | None = None,
     output_router_logits: bool | None = None,
     logits_to_keep: int | torch.Tensor = 0,
@@ -373,7 +393,7 @@ def _deepseek_v4_liger_forward(
     else:
         loss = deepseek_v4_packed_liger_causal_lm_loss(
             hidden_states,
-            cast(GGUFLinear, self.lm_head),
+            cast(GgufLinear, self.lm_head),
             labels,
             hidden_size=self.config.hidden_size,
             loss_kwargs=kwargs,
@@ -418,9 +438,9 @@ def apply_deepseek_v4_liger_loss(
             "DeepSeek V4 Liger loss requires DeepseekV4ForCausalLM, got "
             f"{type(base).__name__}."
         )
-    if not isinstance(base.lm_head, GGUFLinear):
+    if not isinstance(base.lm_head, GgufLinear):
         raise TypeError(
-            "DeepSeek V4 GGUF loss requires GGUFLinear lm_head, got "
+            "DeepSeek V4 GGUF loss requires GgufLinear lm_head, got "
             f"{type(base.lm_head).__name__}."
         )
     if getattr(base, "_deepseek_v4_liger_loss_enabled", False):

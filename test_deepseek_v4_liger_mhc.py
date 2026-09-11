@@ -196,6 +196,42 @@ def test_fused_mhc_matches_transformers_forward_and_activation_gradients() -> No
     assert scale.grad is None
 
 
+def test_prepare_handles_undefined_residual_and_coefficient_cotangents() -> None:
+    """Dropping the residual and coefficient outputs must still give correct grads.
+
+    The engine materializes zeros for the two undefined cotangents, so the
+    backward reads them like any other gradient rather than branching on None.
+    """
+
+    torch.manual_seed(24)
+    rows = 2048
+    fn, fn_reference, base, scale = _controls()
+    x_data = torch.randn(rows, _HC, _HIDDEN, device="cuda", dtype=torch.bfloat16)
+    grad_collapsed = torch.randn(rows, _HIDDEN, device="cuda", dtype=torch.bfloat16)
+
+    candidate_x = x_data.clone().requires_grad_()
+    # Only the collapsed output is consumed. Residual and coefficients are dropped.
+    collapsed = deepseek_v4_mhc_prepare(candidate_x, fn, base, scale)[2]
+    torch.autograd.backward(collapsed, grad_collapsed)
+
+    reference_x = x_data.clone().requires_grad_()
+    reference_collapsed, _ = _reference(
+        reference_x,
+        torch.zeros(rows, _HIDDEN, device="cuda", dtype=torch.bfloat16),
+        fn_reference,
+        base,
+        scale,
+    )
+    torch.autograd.backward(reference_collapsed, grad_collapsed)
+
+    _assert_mixed_close(
+        _require_grad(candidate_x),
+        _require_grad(reference_x),
+        minimum_cosine=0.9999,
+        maximum_relative_rmse=0.01,
+    )
+
+
 def test_fused_mhc_runs_exact_batch_1_4_16_geometries() -> None:
     fn, _, base, scale = _controls(44)
     for rows in (2048, 8192, 32768):

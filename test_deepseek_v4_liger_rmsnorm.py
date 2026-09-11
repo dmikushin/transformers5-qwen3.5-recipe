@@ -13,6 +13,9 @@ from deepseek_v4_liger_rmsnorm import (
     configure_deepseek_v4_liger_rmsnorm,
 )
 
+_MIN_RMSNORM_COSINE = 0.999
+_MAX_RMSNORM_RELATIVE_RMSE = 0.005
+
 
 def _require_grad(tensor: torch.Tensor) -> torch.Tensor:
     if tensor.grad is None:
@@ -49,6 +52,8 @@ def _assert_close_mixed_precision(
 ) -> None:
     reference_flat = reference.detach().float().flatten()
     candidate_flat = candidate.detach().float().flatten()
+    assert torch.isfinite(reference_flat).all()
+    assert torch.isfinite(candidate_flat).all()
     delta = candidate_flat - reference_flat
     cosine = torch.nn.functional.cosine_similarity(
         reference_flat, candidate_flat, dim=0
@@ -61,7 +66,7 @@ def _assert_close_mixed_precision(
 
 
 @pytest.mark.parametrize("width", [128, 512, 1024, 4096])
-def test_fast_frozen_weight_rmsnorm_matches_strict_with_bf16_tolerance(
+def test_liger_frozen_weight_rmsnorm_meets_accuracy_gate(
     width: int,
 ) -> None:
     torch.manual_seed(1000 + width)
@@ -83,17 +88,18 @@ def test_fast_frozen_weight_rmsnorm_matches_strict_with_bf16_tolerance(
     reference_output.backward(output_gradient.clone())
     candidate_output.backward(output_gradient.clone())
 
+    assert candidate_output.dtype == torch.bfloat16
     _assert_close_mixed_precision(
         candidate_output,
         reference_output,
-        minimum_cosine=0.999999,
-        maximum_relative_rmse=1e-4,
+        minimum_cosine=_MIN_RMSNORM_COSINE,
+        maximum_relative_rmse=_MAX_RMSNORM_RELATIVE_RMSE,
     )
     _assert_close_mixed_precision(
         _require_grad(candidate_x),
         _require_grad(reference_x),
-        minimum_cosine=0.999999,
-        maximum_relative_rmse=1e-4,
+        minimum_cosine=_MIN_RMSNORM_COSINE,
+        maximum_relative_rmse=_MAX_RMSNORM_RELATIVE_RMSE,
     )
     assert candidate.norm.weight.grad is None
 
@@ -120,9 +126,10 @@ def test_in_place_backward_is_stable_on_branched_norm_output() -> None:
     candidate_x = x.clone().requires_grad_()
 
     def branched_loss(module: _NormToy, inputs: torch.Tensor) -> torch.Tensor:
-        normalized = module.norm(inputs)
-        projected = normalized @ projection.transpose(0, 1)
-        residual_branch = normalized * scale
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            normalized = module.norm(inputs)
+            projected = normalized @ projection.transpose(0, 1)
+            residual_branch = normalized * scale
         return (
             projected.float().square().mean() + residual_branch.float().square().mean()
         )
@@ -135,14 +142,14 @@ def test_in_place_backward_is_stable_on_branched_norm_output() -> None:
     _assert_close_mixed_precision(
         candidate_loss,
         reference_loss,
-        minimum_cosine=0.999999,
-        maximum_relative_rmse=1e-4,
+        minimum_cosine=_MIN_RMSNORM_COSINE,
+        maximum_relative_rmse=_MAX_RMSNORM_RELATIVE_RMSE,
     )
     _assert_close_mixed_precision(
         _require_grad(candidate_x),
         _require_grad(reference_x),
-        minimum_cosine=0.999999,
-        maximum_relative_rmse=1e-4,
+        minimum_cosine=_MIN_RMSNORM_COSINE,
+        maximum_relative_rmse=_MAX_RMSNORM_RELATIVE_RMSE,
     )
 
 

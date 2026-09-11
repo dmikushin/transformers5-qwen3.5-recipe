@@ -9,27 +9,26 @@ import pytest
 import torch
 from peft import LoraConfig
 from torch.utils._python_dispatch import TorchDispatchMode
-from transformers.integrations.gguf import (
-    ALL_GGUF_EXPERTS_FUNCTIONS,
-    DeepseekV4GGUFExperts,
+from transformers.integrations.gguf.gguf_quantized_parameter import (
+    GgufQuantizedParameter,
 )
-from transformers.integrations.gguf_dequant import (
-    GGUFQuantizedTensor,
-    dequantize_gguf_tensor,
+from transformers.integrations.gguf.moe import (
+    ALL_GGUF_EXPERTS_FUNCTIONS,
+    DeepseekV4GgufExperts,
 )
 
 import fast_moe_lora
 from deepseek_v4_moe_lora import (
     EXPERTS_IMPLEMENTATION,
-    DeepseekV4GGUFMoeLora,
+    DeepseekV4GgufMoeLora,
     _bind_deepseek_expert_priors,
     deepseek_v4_gguf_mmq_aiter_lora_forward,
 )
 from fast_moe_lora import (
     _base_grouped_linear,
     _base_grouped_pair,
-    _group_sizes_from_offsets,
 )
+from gguf_support import dequantize_gguf_tensor
 
 
 @pytest.fixture(autouse=True)
@@ -77,7 +76,7 @@ class _BindingToyBlock(torch.nn.Module):
             swiglu_limit=1.0,
             _experts_implementation="eager",
         )
-        self.experts = DeepseekV4GGUFExperts(
+        self.experts = DeepseekV4GgufExperts(
             config,
             device="cpu",
             compute_dtype=torch.bfloat16,
@@ -111,7 +110,7 @@ def reader() -> gguf.GGUFReader:
     return gguf.GGUFReader(_MODEL)
 
 
-def _packed_experts(reader: gguf.GGUFReader, projection: str) -> GGUFQuantizedTensor:
+def _packed_experts(reader: gguf.GGUFReader, projection: str) -> GgufQuantizedParameter:
     tensor = next(
         item
         for item in reader.tensors
@@ -120,7 +119,7 @@ def _packed_experts(reader: gguf.GGUFReader, projection: str) -> GGUFQuantizedTe
     payload = torch.from_numpy(
         np.array(tensor.data, dtype=np.uint8, copy=True, order="C")
     ).to("cuda")
-    return GGUFQuantizedTensor(
+    return GgufQuantizedParameter(
         payload,
         quant_type=tensor.tensor_type,
         logical_shape=tuple(int(size) for size in reversed(tensor.shape)),
@@ -131,9 +130,9 @@ def test_iq2_xxs_and_q2_k_use_native_grouped_mmq_backward(
     reader: gguf.GGUFReader,
 ) -> None:
     generator = torch.Generator(device="cuda").manual_seed(2468)
-    experts = torch.tensor([0, 1], device="cuda", dtype=torch.long)
+    experts = torch.tensor([0, 1], device="cuda", dtype=torch.int64)
     offsets = torch.tensor([4096, 12288], device="cuda", dtype=torch.int32)
-    group_sizes = _group_sizes_from_offsets(offsets)
+    group_sizes = torch.tensor([4096, 8192], device="cuda", dtype=torch.int32)
     probe_rows = (0, 4096)
 
     gate = _packed_experts(reader, "gate")
@@ -257,7 +256,7 @@ def test_complete_deepseek_expert_lora_preserves_clamp_and_has_finite_gradients(
         swiglu_limit=0.05,
         _experts_implementation=EXPERTS_IMPLEMENTATION,
     )
-    experts = DeepseekV4GGUFExperts(
+    experts = DeepseekV4GgufExperts(
         config,
         device="meta",
         compute_dtype=torch.bfloat16,
@@ -278,7 +277,7 @@ def test_complete_deepseek_expert_lora_preserves_clamp_and_has_finite_gradients(
         bias="none",
     )
     experts.__dict__["_aiter_expert_prior"] = "deepseek-learned"
-    layer = DeepseekV4GGUFMoeLora(
+    layer = DeepseekV4GgufMoeLora(
         experts,
         "default",
         config=lora_config,

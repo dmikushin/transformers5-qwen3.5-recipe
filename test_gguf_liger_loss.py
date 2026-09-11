@@ -12,8 +12,10 @@ from liger_kernel.transformers.model.loss_utils import (
     unpack_cross_entropy_result,
 )
 from torch.utils._python_dispatch import TorchDispatchMode
-from transformers.integrations.gguf import GGUFLinear
-from transformers.integrations.gguf_dequant import GGUFQuantizedTensor
+from transformers.integrations.gguf.gguf_quantized_parameter import (
+    GgufQuantizedParameter,
+)
+from transformers.integrations.gguf.modules import GgufLinear
 
 from gguf_liger_loss import (
     _PACKED_LM_HEAD_CHUNK_SIZE,
@@ -47,7 +49,7 @@ class _MMQCounter(TorchDispatchMode):
 
 
 @pytest.fixture(scope="module")
-def q6_lm_head() -> GGUFLinear:
+def q6_lm_head() -> GgufLinear:
     if not _MODEL.is_file():
         pytest.skip("GGUF model is unavailable")
     reader = gguf.GGUFReader(_MODEL)
@@ -55,7 +57,7 @@ def q6_lm_head() -> GGUFLinear:
     out_features = int(tensor.data.shape[0])
     packed_host = np.array(tensor.data, dtype=np.uint8, copy=True, order="C")
     packed = torch.from_numpy(packed_host).to("cuda")
-    module = GGUFLinear(
+    module = GgufLinear(
         2048,
         out_features,
         bias=False,
@@ -63,7 +65,7 @@ def q6_lm_head() -> GGUFLinear:
         dtype=torch.bfloat16,
         compute_dtype=torch.bfloat16,
     )
-    module.weight = GGUFQuantizedTensor(
+    module.weight = GgufQuantizedParameter(
         packed,
         quant_type=tensor.tensor_type,
         logical_shape=(out_features, 2048),
@@ -72,7 +74,7 @@ def q6_lm_head() -> GGUFLinear:
 
 
 def test_packed_q8_liger_loss_matches_logical_reference_and_uses_native_ops(
-    q6_lm_head: GGUFLinear,
+    q6_lm_head: GgufLinear,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     generator = torch.Generator(device="cuda").manual_seed(12345)
@@ -180,7 +182,7 @@ def test_packed_q8_liger_loss_matches_logical_reference_and_uses_native_ops(
     ),
 )
 def test_packed_q8_liger_loss_rejects_unsupported_objectives(
-    q6_lm_head: GGUFLinear,
+    q6_lm_head: GgufLinear,
     loss_kwargs: dict,
     message: str,
 ) -> None:
@@ -198,7 +200,7 @@ def test_packed_q8_liger_loss_rejects_unsupported_objectives(
 
 
 def test_packed_q8_liger_loss_rejects_higher_order_gradients(
-    q6_lm_head: GGUFLinear,
+    q6_lm_head: GgufLinear,
 ) -> None:
     hidden = torch.randn(
         1, 64, 2048, device="cuda", dtype=torch.bfloat16, requires_grad=True

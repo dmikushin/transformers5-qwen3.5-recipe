@@ -11,10 +11,12 @@ The optimized training workloads are sequence length 2,048 at physical batches
 * DeepSeek V4 hash routers have the same hidden/expert geometry and top-6
   weights, but their expert IDs come from the fixed token lookup table.
 
-The linear projection remains a framework GEMM. The Triton kernel replaces
-full-width softmax/sqrt-softplus plus ``torch.topk`` with one 256-expert streaming
-selection. Normalization is then evaluated only for the selected 8 or 6
-experts, preserving ordinary autograd for router-score gradients.
+The linear projection is a normal BF16 ``F.linear`` (FP32 internal
+accumulation) whose BF16 result is upcast to FP32 so the scoring path stays in
+FP32. The Triton kernel replaces full-width softmax/sqrt-softplus plus
+``torch.topk`` with one 256-expert streaming selection. Normalization is then
+evaluated only for the selected 8 or 6 experts, preserving ordinary autograd
+for router-score gradients.
 """
 
 from types import MethodType
@@ -251,7 +253,7 @@ def router_topk_indices(
     logits = logits.contiguous()
     indices = torch.empty(
         (num_tokens, top_k),
-        dtype=torch.long,
+        dtype=torch.int64,
         device=logits.device,
     )
     block_m, block_n, num_warps = _router_topk_launch(num_tokens)
@@ -275,12 +277,13 @@ def _qwen_router_forward(
     hidden_states: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     flat = hidden_states.reshape(-1, self.hidden_dim)
-    router_logits = F.linear(flat, self.weight)
+    # BF16 GEMM (FP32 accumulation) rounded to BF16 at the projection, then
+    # upcast so the score function, FP32 correction bias, selection, and
+    # normalization below stay in FP32.
+    router_logits = F.linear(flat, self.weight).to(torch.float32)
     router_indices = router_topk_indices(router_logits, self.top_k)
     selected_logits = router_logits.gather(1, router_indices)
-    router_scores = torch.softmax(selected_logits, dtype=torch.float32, dim=-1).to(
-        router_logits.dtype
-    )
+    router_scores = torch.softmax(selected_logits, dtype=torch.float32, dim=-1)
     return router_logits, router_scores, router_indices
 
 
@@ -290,7 +293,7 @@ def _deepseek_topk_router_forward(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     self = cast(Any, self)
     flat = hidden_states.reshape(-1, self.hidden_dim)
-    logits = F.linear(flat.float(), self.weight.float())
+    logits = F.linear(flat, self.weight).to(torch.float32)
     indices = router_topk_indices(
         logits,
         self.top_k,
@@ -309,7 +312,7 @@ def _deepseek_hash_router_forward(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     self = cast(Any, self)
     flat = hidden_states.reshape(-1, self.hidden_dim)
-    logits = F.linear(flat.float(), self.weight.float())
+    logits = F.linear(flat, self.weight).to(torch.float32)
     indices = self.tid2eid[input_ids.reshape(-1)].long()
     scores = self.score_fn(logits.gather(1, indices))
     weights = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20)

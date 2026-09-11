@@ -1,4 +1,5 @@
 import os
+import warnings
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -9,24 +10,23 @@ import torch
 from peft import LoraConfig
 from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils.checkpoint import checkpoint
-from transformers.integrations.gguf import ALL_GGUF_EXPERTS_FUNCTIONS, GGUFExperts
-from transformers.integrations.gguf_dequant import (
-    GGUFQuantizedTensor,
-    dequantize_gguf_tensor,
+from transformers.integrations.gguf.gguf_quantized_parameter import (
+    GgufQuantizedParameter,
 )
+from transformers.integrations.gguf.moe import ALL_GGUF_EXPERTS_FUNCTIONS, GgufExperts
 
 import fast_moe_lora
 from fast_moe_lora import (
     EXPERTS_IMPLEMENTATION,
-    FastGGUFMoeLora,
+    FastGgufMoeLora,
     _aiter_input_grad,
     _base_grouped_linear,
     _base_grouped_pair,
-    _complete_group_sizes,
-    _group_sizes_from_offsets,
+    _prepare_packed_expert_execution,
     aiter_grouped_mm,
     qwen3_5_moe_gguf_mmq_aiter_lora_forward,
 )
+from gguf_support import dequantize_gguf_tensor
 
 
 class _RecordOps(TorchDispatchMode):
@@ -82,7 +82,7 @@ def _packed_projection(
     num_experts: int,
     out_features: int,
     layer: int = 10,
-) -> GGUFQuantizedTensor:
+) -> GgufQuantizedParameter:
     tensor = next(
         item
         for item in reader.tensors
@@ -96,7 +96,7 @@ def _packed_projection(
             order="C",
         )
     ).to("cuda")
-    return GGUFQuantizedTensor(
+    return GgufQuantizedParameter(
         payload,
         quant_type=tensor.tensor_type,
         logical_shape=(num_experts, out_features, int(tensor.shape[0])),
@@ -135,7 +135,7 @@ def test_packed_expert_projection_backward_is_exact_logical_jacobian(
 ) -> None:
     experts = torch.tensor([0, 2, 5], device="cuda", dtype=torch.int64)
     offsets = torch.tensor([4096, 12288, 16384], device="cuda", dtype=torch.int32)
-    group_sizes = _group_sizes_from_offsets(offsets)
+    group_sizes = torch.tensor([4096, 8192, 4096], device="cuda", dtype=torch.int32)
     generator = torch.Generator(device="cuda").manual_seed(2468)
 
     gate = _packed_projection(reader, "gate", num_experts=256, out_features=512)
@@ -251,11 +251,170 @@ def test_packed_expert_projection_backward_is_exact_logical_jacobian(
     assert down.grad is None
 
 
+def _count_synchronizing_calls(call) -> int:
+    """Count the synchronizing CUDA operations a call performs."""
+
+    if not hasattr(torch.cuda, "set_sync_debug_mode"):
+        pytest.skip("torch.cuda.set_sync_debug_mode is unavailable")
+    call()
+    torch.cuda.synchronize()
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        torch.cuda.set_sync_debug_mode("warn")
+        try:
+            call()
+        finally:
+            torch.cuda.set_sync_debug_mode("default")
+    return sum("synchronizing CUDA operation" in str(entry.message) for entry in caught)
+
+
+def test_packed_expert_execution_returns_fixed_length_group_metadata() -> None:
+    """Every expert is a group, so no routed row count reaches the host."""
+
+    num_tokens, top_k, num_experts = 2048, 8, 256
+    generator = torch.Generator(device="cuda").manual_seed(2468)
+    top_k_index = torch.randint(
+        0,
+        num_experts,
+        (num_tokens, top_k),
+        generator=generator,
+        device="cuda",
+        dtype=torch.int64,
+    )
+    expert_indices, _ = torch.sort(top_k_index.reshape(-1))
+    plan = SimpleNamespace(expert_indices=expert_indices)
+
+    expert_ids, offsets, group_sizes = _prepare_packed_expert_execution(
+        plan, num_experts
+    )
+
+    # Reference counts from the compacted form, scattered back onto every expert.
+    unique_ids, unique_counts = torch.unique_consecutive(
+        expert_indices, return_counts=True
+    )
+    expected_sizes = torch.zeros(
+        num_experts, device="cuda", dtype=torch.int32
+    ).index_copy(0, unique_ids, unique_counts.to(torch.int32))
+
+    torch.testing.assert_close(
+        expert_ids,
+        torch.arange(num_experts, device="cuda", dtype=torch.int64),
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(group_sizes, expected_sizes, rtol=0, atol=0)
+    # Offsets are the prefix sums of the sizes they are returned with, not a
+    # second derivation of them.
+    torch.testing.assert_close(
+        offsets, expected_sizes.cumsum(0, dtype=torch.int32), rtol=0, atol=0
+    )
+    assert offsets.dtype == torch.int32
+    assert group_sizes.dtype == torch.int32
+    assert expert_ids.is_contiguous()
+    assert int(offsets[-1]) == expert_indices.numel()
+    assert int(group_sizes.sum()) == expert_indices.numel()
+    # `unique_consecutive` used to run here, sizing its output on the host and
+    # stalling the pipeline once per MoE layer.
+    assert (
+        _count_synchronizing_calls(
+            lambda: _prepare_packed_expert_execution(plan, num_experts)
+        )
+        == 0
+    )
+
+
+@pytest.mark.parametrize("projection", ["pair", "single"])
+def test_fixed_group_layout_is_inert_for_unselected_experts(
+    reader: gguf.GGUFReader,
+    projection: str,
+) -> None:
+    """Empty groups must not change kernel results or gradients."""
+
+    routes, num_experts = 16384, 256
+    generator = torch.Generator(device="cuda").manual_seed(1357)
+    # Three selected experts leave 253 empty groups in the fixed layout.
+    expert_indices = (
+        torch.randint(0, 3, (routes,), generator=generator, device="cuda").sort().values
+    )
+    plan = SimpleNamespace(expert_indices=expert_indices)
+
+    fixed_ids, fixed_offsets, fixed_sizes = _prepare_packed_expert_execution(
+        plan, num_experts
+    )
+    compact_ids, compact_counts = torch.unique_consecutive(
+        expert_indices, return_counts=True
+    )
+    compact_sizes = compact_counts.to(torch.int32)
+    compact_offsets = compact_sizes.cumsum(0, dtype=torch.int32)
+    assert int(fixed_sizes.numel()) == num_experts
+    assert int(compact_sizes.numel()) == 3
+
+    results = {}
+    if projection == "pair":
+        gate = _packed_projection(reader, "gate", num_experts=256, out_features=512)
+        up = _packed_projection(reader, "up", num_experts=256, out_features=512)
+        hidden = torch.randn(
+            routes, 2048, generator=generator, device="cuda", dtype=torch.bfloat16
+        )
+        cotangents = tuple(
+            torch.randn(
+                routes, 512, generator=generator, device="cuda", dtype=torch.bfloat16
+            )
+            for _ in range(2)
+        )
+    else:
+        gate = _packed_projection(reader, "down", num_experts=256, out_features=2048)
+        up = None
+        hidden = torch.randn(
+            routes, 512, generator=generator, device="cuda", dtype=torch.bfloat16
+        )
+        cotangents = (
+            torch.randn(
+                routes, 2048, generator=generator, device="cuda", dtype=torch.bfloat16
+            ),
+        )
+
+    for name, (ids, offsets, sizes) in (
+        ("fixed", (fixed_ids, fixed_offsets, fixed_sizes)),
+        ("compacted", (compact_ids, compact_offsets, compact_sizes)),
+    ):
+        leaf = hidden.detach().clone().requires_grad_(True)
+        if projection == "pair":
+            assert up is not None
+            first, second = _base_grouped_pair(
+                leaf, gate, up, ids, offsets, sizes, torch.bfloat16
+            )
+            gradients = torch.autograd.grad((first, second), leaf, cotangents)
+            results[name] = (first, second, *gradients)
+        else:
+            output = _base_grouped_linear(
+                leaf, gate, ids, offsets, sizes, torch.bfloat16
+            )
+            (gradient,) = torch.autograd.grad(output, leaf, cotangents)
+            results[name] = (output, gradient)
+
+    assert all(
+        torch.equal(fixed, compacted)
+        for fixed, compacted in zip(results["fixed"], results["compacted"], strict=True)
+    )
+
+
 def test_full_group_lora_eliminates_selection_and_zeros_inactive_gradients() -> None:
     generator = torch.Generator(device="cuda").manual_seed(8642)
     active_experts = torch.tensor([1, 4, 7], device="cuda", dtype=torch.int64)
     active_sizes = torch.tensor([2, 3, 1], device="cuda", dtype=torch.int32)
-    full_sizes = _complete_group_sizes(active_sizes, active_experts, 8)
+    # Sorted route-level expert ids: expert 1 twice, 4 three times, 7 once. These
+    # are the group sizes the production path hands to every grouped MM.
+    routes = torch.tensor([1, 1, 4, 4, 4, 7], device="cuda", dtype=torch.int64)
+    _, _, full_sizes = _prepare_packed_expert_execution(
+        SimpleNamespace(expert_indices=routes), 8
+    )
+    torch.testing.assert_close(
+        full_sizes,
+        torch.tensor([0, 2, 0, 0, 3, 0, 0, 1], device="cuda", dtype=torch.int32),
+        rtol=0,
+        atol=0,
+    )
     lhs = torch.randn(
         6,
         16,
@@ -403,8 +562,137 @@ def test_aiter_grouped_mm_rejects_layout_repairs() -> None:
         torch.autograd.grad(output, (valid_lhs, valid_factor), strided_gradient)
 
 
+def test_aiter_grouped_mm_rebuilds_routed_rows_instead_of_retaining_them() -> None:
+    """The routed rows are replayed from the routing index, not held."""
+
+    generator = torch.Generator(device="cuda").manual_seed(13579)
+    tokens, top_k, experts, hidden, rank = 2, 3, 8, 16, 4
+    routes = tokens * top_k
+    top_k_index = torch.randint(
+        0,
+        experts,
+        (tokens, top_k),
+        generator=generator,
+        device="cuda",
+        dtype=torch.int64,
+    )
+    expert_ids, permutation = torch.sort(top_k_index.reshape(-1))
+    group_sizes = torch.bincount(expert_ids, minlength=experts).to(torch.int32)
+    source = torch.randn(
+        (tokens, hidden), generator=generator, device="cuda", dtype=torch.bfloat16
+    )
+    # The reconstruction contract `_lora_grouped_linear` relies on.
+    routed_rows = source[permutation // top_k]
+
+    def build_lhs() -> torch.Tensor:
+        return routed_rows.detach().clone().requires_grad_(True)
+
+    factor_values = torch.randn(
+        (experts, rank, hidden),
+        generator=generator,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+
+    grad_output = torch.randn(
+        (routes, rank), generator=generator, device="cuda", dtype=torch.bfloat16
+    )
+
+    retained: list[torch.Tensor] = []
+
+    def pack(tensor: torch.Tensor) -> torch.Tensor:
+        retained.append(tensor)
+        return tensor
+
+    rebuild_lhs = build_lhs()
+    rebuild_source = source.detach().clone().requires_grad_(True)
+    rebuild_factor = factor_values.detach().clone().requires_grad_(True)
+    with torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
+        rebuilt_output = aiter_grouped_mm(
+            rebuild_lhs,
+            rebuild_factor.transpose(1, 2),
+            group_sizes,
+            expert_prior="qwen-learned",
+            lhs_source=rebuild_source,
+            lhs_permutation=permutation,
+            lhs_top_k=top_k,
+        )
+    assert not any(tensor is rebuild_lhs for tensor in retained)
+    assert any(tensor is rebuild_source for tensor in retained)
+    assert any(tensor is permutation for tensor in retained)
+
+    direct_lhs = build_lhs()
+    direct_factor = factor_values.detach().clone().requires_grad_(True)
+    direct_output = aiter_grouped_mm(
+        direct_lhs,
+        direct_factor.transpose(1, 2),
+        group_sizes,
+        expert_prior="qwen-learned",
+    )
+
+    assert torch.equal(rebuilt_output, direct_output)
+    rebuilt_gradients = torch.autograd.grad(
+        rebuilt_output, (rebuild_lhs, rebuild_factor), grad_output
+    )
+    direct_gradients = torch.autograd.grad(
+        direct_output, (direct_lhs, direct_factor), grad_output
+    )
+    for rebuilt_gradient, direct_gradient in zip(rebuilt_gradients, direct_gradients):
+        assert torch.equal(rebuilt_gradient, direct_gradient)
+
+
+def test_aiter_grouped_mm_rejects_incomplete_row_rebuilds() -> None:
+    lhs = torch.randn(6, 16, device="cuda", dtype=torch.bfloat16)
+    factor = torch.randn(8, 4, 16, device="cuda", dtype=torch.bfloat16)
+    group_sizes = torch.tensor(
+        [0, 2, 0, 0, 3, 0, 0, 1], device="cuda", dtype=torch.int32
+    )
+    source = lhs.detach().clone()
+    permutation = torch.zeros(6, device="cuda", dtype=torch.int64)
+
+    with pytest.raises(ValueError, match="requires the routing permutation"):
+        aiter_grouped_mm(
+            lhs,
+            factor.transpose(1, 2),
+            group_sizes,
+            expert_prior="qwen-learned",
+            lhs_source=source,
+        )
+    with pytest.raises(ValueError, match="requires top_k >= 1"):
+        aiter_grouped_mm(
+            lhs,
+            factor.transpose(1, 2),
+            group_sizes,
+            expert_prior="qwen-learned",
+            lhs_source=source,
+            lhs_permutation=permutation,
+            lhs_top_k=0,
+        )
+    with pytest.raises(ValueError, match="row-major source"):
+        aiter_grouped_mm(
+            lhs,
+            factor.transpose(1, 2),
+            group_sizes,
+            expert_prior="qwen-learned",
+            lhs_source=source.T,
+            lhs_permutation=permutation,
+            lhs_top_k=1,
+        )
+    with pytest.raises(ValueError, match="one row index per lhs row"):
+        aiter_grouped_mm(
+            lhs,
+            factor.transpose(1, 2),
+            group_sizes,
+            expert_prior="qwen-learned",
+            lhs_source=source,
+            lhs_permutation=permutation[:5],
+            lhs_top_k=1,
+        )
+
+
 def test_one_expert_layer_has_finite_lora_gradients_and_no_packed_gradients(
     reader: gguf.GGUFReader,
+    monkeypatch,
 ) -> None:
     config = SimpleNamespace(
         num_experts=256,
@@ -413,7 +701,7 @@ def test_one_expert_layer_has_finite_lora_gradients_and_no_packed_gradients(
         hidden_act="silu",
         _experts_implementation=EXPERTS_IMPLEMENTATION,
     )
-    experts = GGUFExperts(config, device="meta", compute_dtype=torch.bfloat16)
+    experts = GgufExperts(config, device="meta", compute_dtype=torch.bfloat16)
     experts.config = config
     experts.gate_proj = _packed_projection(
         reader, "gate", num_experts=256, out_features=512
@@ -436,7 +724,7 @@ def test_one_expert_layer_has_finite_lora_gradients_and_no_packed_gradients(
         bias="none",
     )
     experts.__dict__["_aiter_expert_prior"] = "qwen-learned"
-    layer = FastGGUFMoeLora(
+    layer = FastGgufMoeLora(
         experts,
         "default",
         config=lora_config,
@@ -485,6 +773,27 @@ def test_one_expert_layer_has_finite_lora_gradients_and_no_packed_gradients(
         dtype=torch.bfloat16,
     )
 
+    # Each LoRA delta has to be folded into the base projection output it belongs
+    # to instead of allocating a full routed-size replacement, so the activations
+    # the gate consumes must be the very objects the base projections produced.
+    base_outputs = []
+    gate_inputs = []
+    real_base_pair = fast_moe_lora._base_grouped_pair
+    real_split_gate = GgufExperts._apply_split_gate
+
+    def recording_base_pair(*args, **kwargs):
+        outputs = real_base_pair(*args, **kwargs)
+        base_outputs.append(outputs)
+        return outputs
+
+    def recording_split_gate(gate, up):
+        gate_inputs.append((gate, up))
+        # nn.Module's dynamic attribute typing hides the real bound method.
+        return real_split_gate(experts, gate, up)  # ty: ignore[call-non-callable]
+
+    monkeypatch.setattr(fast_moe_lora, "_base_grouped_pair", recording_base_pair)
+    experts.__dict__["_apply_split_gate"] = recording_split_gate
+
     dispatched_ops: list[str] = []
     with _RecordOps(dispatched_ops):
         output = layer(hidden, top_k_index, top_k_weights)
@@ -512,3 +821,8 @@ def test_one_expert_layer_has_finite_lora_gradients_and_no_packed_gradients(
     )
     assert not any("index_select" in operation for operation in dispatched_ops)
     assert all(parameter.grad is None for parameter in experts.parameters())
+
+    assert len(base_outputs) == 1
+    assert len(gate_inputs) == 1
+    assert gate_inputs[0][0] is base_outputs[0][0]
+    assert gate_inputs[0][1] is base_outputs[0][1]

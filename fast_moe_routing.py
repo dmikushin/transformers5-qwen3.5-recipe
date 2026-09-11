@@ -142,14 +142,16 @@ def _route_gather_backward_kernel(
     )
     reduced = tl.zeros((HIDDEN_SIZE,), dtype=tl.float32)
 
-    # PyTorch's sorted index backward rounds the destination to BF16 after
-    # every duplicate. Preserve that order and rounding exactly.
+    # Duplicates accumulate in FP32 and round once on the store. Eager autograd
+    # rounds the BF16 destination after every duplicate instead. The difference is
+    # BF16 accumulation noise (~4e-3 relative RMSE over 32,768 routes), so the
+    # regression test gates it rather than reproducing the rounding order.
     for _ in tl.static_range(0, TOP_K):
         position = tl.min(remaining_positions, axis=0)
         grad = tl.load(grad_selected + position * HIDDEN_SIZE + hidden_offsets).to(
             tl.float32
         )
-        reduced = (reduced + grad).to(tl.bfloat16).to(tl.float32)
+        reduced = reduced + grad
         remaining_positions = tl.where(
             remaining_positions == position,
             0x7FFFFFFF,
@@ -183,9 +185,11 @@ def _route_combine_forward_kernel(
             mask=hidden_mask,
             other=0.0,
         ).to(tl.float32)
-        weight = (
-            tl.load(routing_weights_ptr + original_route).to(tl.bfloat16).to(tl.float32)
-        )
+        # The gate's dtype is preserved: the model multiplies the BF16 expert
+        # output by the routing weight as returned by the gate, so rounding it to
+        # BF16 here would discard the router's FP32 precision (~2e-3 relative
+        # RMSE against an FP32-accumulated reference).
+        weight = tl.load(routing_weights_ptr + original_route).to(tl.float32)
         accumulated += values * weight
     tl.store(
         result_ptr + token * HIDDEN + hidden_offsets,
@@ -214,7 +218,9 @@ def _route_combine_backward_kernel(
     output = tl.load(expert_output + sorted_route * HIDDEN_SIZE + hidden_offsets).to(
         tl.float32
     )
-    weight = tl.load(routing_weights + original_route).to(tl.bfloat16).to(tl.float32)
+    # As in the forward kernel, the gate's dtype is preserved for the activation
+    # gradient. The weight gradient below does not read it at all.
+    weight = tl.load(routing_weights + original_route).to(tl.float32)
 
     output_grad = (grad * weight).to(tl.bfloat16)
     weight_grad_product = grad * output

@@ -7,8 +7,10 @@ import pytest
 import torch
 from liger_kernel.transformers.model.loss_utils import LigerForCausalLMLoss
 from torch.utils._python_dispatch import TorchDispatchMode
-from transformers.integrations.gguf import GGUFLinear
-from transformers.integrations.gguf_dequant import GGUFQuantizedTensor
+from transformers.integrations.gguf.gguf_quantized_parameter import (
+    GgufQuantizedParameter,
+)
+from transformers.integrations.gguf.modules import GgufLinear
 
 from deepseek_v4_liger_loss import (
     deepseek_v4_liger_causal_lm_loss,
@@ -29,11 +31,11 @@ def _require_grad(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.grad
 
 
-def _q8_lm_head(weight: np.ndarray) -> GGUFLinear:
+def _q8_lm_head(weight: np.ndarray) -> GgufLinear:
     packed = torch.from_numpy(
         gguf.quantize(weight.astype(np.float32), gguf.GGMLQuantizationType.Q8_0).copy()
     ).to("cuda")
-    head = GGUFLinear(
+    head = GgufLinear(
         weight.shape[1],
         weight.shape[0],
         bias=False,
@@ -41,7 +43,7 @@ def _q8_lm_head(weight: np.ndarray) -> GGUFLinear:
         dtype=torch.bfloat16,
         compute_dtype=torch.bfloat16,
     )
-    head.weight = GGUFQuantizedTensor(
+    head.weight = GgufQuantizedParameter(
         packed,
         quant_type=gguf.GGMLQuantizationType.Q8_0,
         logical_shape=weight.shape,
@@ -107,7 +109,7 @@ def test_packed_q8_0_liger_loss_uses_native_mmq_without_materializing_head() -> 
     packed_weight = torch.from_numpy(
         np.array(tensor.data, dtype=np.uint8, copy=True, order="C")
     ).to("cuda")
-    head = GGUFLinear(
+    head = GgufLinear(
         4096,
         129280,
         bias=False,
@@ -115,7 +117,7 @@ def test_packed_q8_0_liger_loss_uses_native_mmq_without_materializing_head() -> 
         dtype=torch.bfloat16,
         compute_dtype=torch.bfloat16,
     )
-    head.weight = GGUFQuantizedTensor(
+    head.weight = GgufQuantizedParameter(
         packed_weight,
         quant_type=tensor.tensor_type,
         logical_shape=(129280, 4096),

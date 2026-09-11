@@ -48,6 +48,42 @@ def _assert_reasonable_routing_gradient(
     assert float(cosine) > 0.99999
 
 
+def _assert_relative_rmse(
+    actual: torch.Tensor,
+    reference: torch.Tensor,
+    maximum: float,
+) -> None:
+    actual_float = actual.detach().double().reshape(-1)
+    reference_float = reference.detach().double().reshape(-1)
+    delta_rmse = (actual_float - reference_float).square().mean().sqrt()
+    reference_rms = reference_float.square().mean().sqrt().clamp_min(1e-12)
+    relative_rmse = float(delta_rmse / reference_rms)
+    assert relative_rmse <= maximum, (relative_rmse, maximum)
+
+
+def _assert_bf16_accumulation_close(
+    actual: torch.Tensor,
+    reference: torch.Tensor,
+) -> None:
+    """Gate FP32 accumulation against eager per-duplicate BF16 rounding.
+
+    The fused gather adds a token's top-k duplicates in FP32 and rounds once on
+    the store. Eager autograd rounds the BF16 destination after every duplicate.
+    The gap is BF16 accumulation noise, measured at 4.0e-3 relative RMSE over
+    32,768 routes, so the bound is one part in a hundred: a few BF16 ulps of
+    accumulation noise passes, while a wrong permutation or inverse permutation
+    (order 1) cannot.
+    """
+
+    _assert_relative_rmse(actual, reference, 1e-2)
+    cosine = torch.nn.functional.cosine_similarity(
+        actual.detach().double().reshape(-1),
+        reference.detach().double().reshape(-1),
+        dim=0,
+    )
+    assert float(cosine) > 0.9999, float(cosine)
+
+
 def _routing_indices(
     num_tokens: int = _TOKENS,
     top_k: int = _TOP_K,
@@ -122,7 +158,7 @@ def test_unsupported_routing_geometry(
     assert not _is_supported_routing_geometry(num_tokens, num_top_k, hidden_dim)
 
 
-def test_route_gather_is_exact_and_has_no_index_put() -> None:
+def test_route_gather_matches_reference_and_has_no_index_put() -> None:
     top_k_index, expected_experts, expected_inverse = _routing_indices()
     generator = torch.Generator(device="cuda").manual_seed(2468)
     hidden = torch.randn(
@@ -163,7 +199,9 @@ def test_route_gather_is_exact_and_has_no_index_put() -> None:
         plan.selected_hidden_states.backward(grad_selected)
     reference_selected.backward(grad_selected)
 
-    torch.testing.assert_close(hidden.grad, reference_hidden.grad, rtol=0, atol=0)
+    _assert_bf16_accumulation_close(
+        _require_grad(hidden), _require_grad(reference_hidden)
+    )
     assert not any("_index_put_impl_" in operation for operation in dispatched_ops)
 
 
@@ -208,13 +246,24 @@ def test_route_combine_forward_and_backward_match_reference(
     )
 
     actual = finalize_expert_routing(output, hidden_states, plan, None)
-    sorted_weights = reference_weights.reshape(-1)[permutation].to(output.dtype)
-    expected = reference_output * sorted_weights.unsqueeze(-1)
-    expected = expected[inverse_permutation]
-    expected = expected.view(_TOKENS, _TOP_K, _HIDDEN).sum(dim=1)
+    # Model semantics: the BF16 expert output is multiplied by the routing weight
+    # in the gate's dtype, and each product is rounded to the residual dtype.
+    sorted_weights = reference_weights.reshape(-1)[permutation]
+    contribution = (reference_output * sorted_weights.unsqueeze(-1)).to(output.dtype)
+    expected = contribution[inverse_permutation]
+    expected = expected.view(_TOKENS, _TOP_K, _HIDDEN).sum(dim=1).to(output.dtype)
     # The fused kernel accumulates weighted BF16 expert outputs in FP32 before
     # the final BF16 store. This is more accurate but can differ by one BF16 step.
     torch.testing.assert_close(actual, expected, rtol=0, atol=0.015625)
+
+    # The fused combine has to keep the gate's precision. Rounding the routing
+    # weight to BF16 before the multiply costs ~2.6e-3 relative RMSE here.
+    ordered = reference_output.double() * sorted_weights.double().unsqueeze(-1)
+    exact = torch.zeros((_TOKENS, _HIDDEN), device="cuda", dtype=torch.float64)
+    exact.index_add_(0, permutation // _TOP_K, ordered)
+    # Quantize the reference the same way the kernel stores, so this gate isolates
+    # the accumulation precision (measured 1.3e-5) rather than the shared BF16 store.
+    _assert_relative_rmse(actual, exact.to(output.dtype), 1e-4)
 
     grad_final = torch.randn(
         (_TOKENS, _HIDDEN),
@@ -281,10 +330,10 @@ def test_noncanonical_token_count_matches_reference(
     plan = prepare_expert_routing(hidden, top_k_index, routing_weights)
     actual = finalize_expert_routing(output, hidden, plan, None)
     reference_selected = reference_hidden[permutation // top_k]
-    sorted_weights = reference_weights.reshape(-1)[permutation].to(output.dtype)
-    expected = reference_output * sorted_weights.unsqueeze(-1)
-    expected = expected[inverse_permutation]
-    expected = expected.view(num_tokens, top_k, hidden_dim).sum(dim=1)
+    sorted_weights = reference_weights.reshape(-1)[permutation]
+    contribution = (reference_output * sorted_weights.unsqueeze(-1)).to(output.dtype)
+    expected = contribution[inverse_permutation]
+    expected = expected.view(num_tokens, top_k, hidden_dim).sum(dim=1).to(output.dtype)
 
     torch.testing.assert_close(
         plan.selected_hidden_states, reference_selected, rtol=0, atol=0
@@ -312,7 +361,9 @@ def test_noncanonical_token_count_matches_reference(
         (grad_selected, grad_final),
     )
 
-    torch.testing.assert_close(hidden.grad, reference_hidden.grad, rtol=0, atol=0)
+    _assert_bf16_accumulation_close(
+        _require_grad(hidden), _require_grad(reference_hidden)
+    )
     torch.testing.assert_close(
         _require_grad(output), _require_grad(reference_output), rtol=0, atol=0
     )

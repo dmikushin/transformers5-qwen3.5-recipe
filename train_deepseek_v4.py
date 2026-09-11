@@ -54,14 +54,20 @@ def fixed_length_lm_collator(examples):
 def main():
     model_dir = Path.home() / "models/ds4"
     gguf_file = "DeepSeek-V4-Flash-IQ2XXS.gguf"
-    tokenizer_id = "deepseek-ai/DeepSeek-V4-Flash"
     dataset_dir = script_dir / "data_tokenized_ds4"
     output_dir = script_dir / "out_deepseek_v4"
     random_seed = 19260817
 
     set_seed(random_seed)
 
-    tokenizer = cast(Any, AutoTokenizer.from_pretrained(tokenizer_id))
+    tokenizer = cast(
+        Any,
+        AutoTokenizer.from_pretrained(
+            model_dir,
+            gguf_file=gguf_file,
+            local_files_only=True,
+        ),
+    )
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
 
@@ -69,6 +75,7 @@ def main():
         model_dir,
         gguf_file=gguf_file,
         gguf_mmap_policy="release",
+        local_files_only=True,
         dtype=torch.bfloat16,
         attn_implementation="eager",  # attn_implementation="flash_attention_2" is unsupported for DeepSeek V4
         device_map={"": "cuda:0"},
@@ -122,6 +129,7 @@ def main():
         save_total_limit=5,
         bf16=True,
         optim="adamw_8bit",
+        use_liger_kernel=False,
         gradient_checkpointing=True,
         gradient_checkpointing_kwargs={"use_reentrant": False},
         remove_unused_columns=False,

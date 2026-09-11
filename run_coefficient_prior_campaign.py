@@ -105,7 +105,7 @@ def main() -> None:
         parser.error("--max-samples must be at least positive --repeats")
     if args.sample_step <= 0 or args.warmup < 0 or args.launches_per_sample <= 0:
         parser.error(
-            "sample-step and launches must be positive; warmup must be nonnegative"
+            "sample-step and launches must be positive, warmup must be nonnegative"
         )
     if args.final_repeats is not None and args.final_repeats <= 0:
         parser.error("--final-repeats must be positive")

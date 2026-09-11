@@ -18,7 +18,7 @@ def test_top6_hidden4096_route_contract_and_summary() -> None:
             [0, 1, 2, 9, 10, 11],
             [0, 1, 12, 13, 14, 15],
         ],
-        dtype=torch.long,
+        dtype=torch.int64,
     )
     weights = torch.softmax(torch.randn(5, 6), dim=-1)
     validate_deepseek_v4_routes(hidden, indices, weights)
@@ -68,7 +68,7 @@ def test_route_weight_comparison_ignores_expert_identity_and_weight_order() -> N
 
 def test_route_contract_rejects_qwen_geometry() -> None:
     hidden = torch.randn(4, 2048, dtype=torch.bfloat16)
-    indices = torch.zeros(4, 8, dtype=torch.long)
+    indices = torch.zeros(4, 8, dtype=torch.int64)
     weights = torch.ones(4, 8)
     with pytest.raises(ValueError, match="4096"):
         validate_deepseek_v4_routes(hidden, indices, weights)

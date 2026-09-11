@@ -8,12 +8,14 @@ import torch
 import torch_ggml_ops
 from peft import LoraConfig, get_peft_model
 from torch.utils._python_dispatch import TorchDispatchMode
-from transformers.integrations.gguf import GGUFGroupedLinear, GGUFLinear
-from transformers.integrations.gguf_dequant import GGUFQuantizedTensor
+from transformers.integrations.gguf.gguf_quantized_parameter import (
+    GgufQuantizedParameter,
+)
+from transformers.integrations.gguf.modules import GgufGroupedLinear, GgufLinear
 
 from deepseek_v4_lora import (
     DEEPSEEK_V4_TARGET_MODULES_PATTERN,
-    DeepseekV4GGUFLoraLinear,
+    DeepseekV4GgufLoraLinear,
     _RejectedDeepseekV4GroupedLora,
     configure_deepseek_v4_grouped_mmq,
     register_deepseek_v4_lora,
@@ -43,11 +45,11 @@ class _RecordOps(TorchDispatchMode):
         return func(*args, **(kwargs or {}))
 
 
-def _q8_linear(weight: np.ndarray) -> GGUFLinear:
+def _q8_linear(weight: np.ndarray) -> GgufLinear:
     packed = torch.from_numpy(
         gguf.quantize(weight.astype(np.float32), gguf.GGMLQuantizationType.Q8_0).copy()
     ).to("cuda")
-    module = GGUFLinear(
+    module = GgufLinear(
         weight.shape[1],
         weight.shape[0],
         bias=False,
@@ -55,7 +57,7 @@ def _q8_linear(weight: np.ndarray) -> GGUFLinear:
         dtype=torch.bfloat16,
         compute_dtype=torch.bfloat16,
     )
-    module.weight = GGUFQuantizedTensor(
+    module.weight = GgufQuantizedParameter(
         packed,
         quant_type=gguf.GGMLQuantizationType.Q8_0,
         logical_shape=weight.shape,
@@ -77,7 +79,7 @@ def test_q8_0_ordinary_lora_uses_native_base_and_fused_residual() -> None:
     class Toy(torch.nn.Module):
         def __init__(self) -> None:
             super().__init__()
-            self.q_a_proj = GGUFLinear(
+            self.q_a_proj = GgufLinear(
                 4096,
                 1024,
                 bias=False,
@@ -85,7 +87,7 @@ def test_q8_0_ordinary_lora_uses_native_base_and_fused_residual() -> None:
                 dtype=torch.bfloat16,
                 compute_dtype=torch.bfloat16,
             )
-            self.q_a_proj.weight = GGUFQuantizedTensor(
+            self.q_a_proj.weight = GgufQuantizedParameter(
                 packed,
                 quant_type=tensor.tensor_type,
                 logical_shape=(1024, 4096),
@@ -104,7 +106,7 @@ def test_q8_0_ordinary_lora_uses_native_base_and_fused_residual() -> None:
     register_deepseek_v4_lora(config)
     model = get_peft_model(Toy(), config, autocast_adapter_dtype=False)
     layer = model.base_model.model.q_a_proj
-    assert isinstance(layer, DeepseekV4GGUFLoraLinear)
+    assert isinstance(layer, DeepseekV4GgufLoraLinear)
 
     with torch.no_grad():
         layer.lora_B["default"].weight.normal_(std=0.02)
@@ -135,7 +137,7 @@ def test_fixed_grouped_q8_0_mmq_matches_dense_packed_reference() -> None:
     packed = torch.from_numpy(
         gguf.quantize(logical_weight, gguf.GGMLQuantizationType.Q8_0).copy()
     ).to("cuda")
-    grouped = GGUFGroupedLinear(
+    grouped = GgufGroupedLinear(
         4096,
         8192,
         8,
@@ -143,7 +145,7 @@ def test_fixed_grouped_q8_0_mmq_matches_dense_packed_reference() -> None:
         dtype=torch.bfloat16,
         compute_dtype=torch.bfloat16,
     )
-    grouped.weight = GGUFQuantizedTensor(
+    grouped.weight = GgufQuantizedParameter(
         packed,
         quant_type=gguf.GGMLQuantizationType.Q8_0,
         logical_shape=logical_weight.shape,
@@ -197,7 +199,7 @@ def test_fixed_grouped_q8_0_mmq_matches_dense_packed_reference() -> None:
 
 
 def test_grouped_output_lora_is_explicitly_rejected() -> None:
-    grouped = GGUFGroupedLinear(
+    grouped = GgufGroupedLinear(
         32,
         24,
         4,

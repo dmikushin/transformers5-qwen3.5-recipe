@@ -2,14 +2,14 @@ from typing import Any, cast
 
 import torch
 from peft import LoraConfig
-from transformers.integrations.gguf import (
+from transformers.integrations.gguf.moe import (
     ALL_GGUF_EXPERTS_FUNCTIONS,
-    DeepseekV4GGUFExperts,
+    DeepseekV4GgufExperts,
 )
 
 from deepseek_v4_lora import DEEPSEEK_V4_TARGET_MODULES_PATTERN
 from fast_moe_lora import (
-    FastGGUFMoeLora,
+    FastGgufMoeLora,
     _ExpertLoraWeights,
     qwen3_5_moe_gguf_mmq_aiter_lora_forward,
 )
@@ -29,7 +29,7 @@ def _bind_deepseek_expert_priors(
     counts = {"deepseek-learned": 0, "deepseek-hash": 0}
 
     for name, module in base.named_modules():
-        if not isinstance(module, DeepseekV4GGUFExperts):
+        if not isinstance(module, DeepseekV4GgufExperts):
             continue
         prior = module.__dict__.get("_aiter_expert_prior", fallback_prior)
         block_name, separator, suffix = name.rpartition(".experts")
@@ -64,7 +64,7 @@ def _bind_deepseek_expert_priors(
     return counts
 
 
-class DeepseekV4GGUFMoeLora(FastGGUFMoeLora):
+class DeepseekV4GgufMoeLora(FastGgufMoeLora):
     """PEFT wrapper for all gate, up, and down transforms of one MoE layer."""
 
     def forward(
@@ -73,9 +73,9 @@ class DeepseekV4GGUFMoeLora(FastGGUFMoeLora):
         adapter_names = kwargs.pop("adapter_names", None)
         lora_weights = self._active_lora_weights(adapter_names)
         experts = self.get_base_layer()
-        if not isinstance(experts, DeepseekV4GGUFExperts):
+        if not isinstance(experts, DeepseekV4GgufExperts):
             raise TypeError(
-                "DeepSeek V4 expert LoRA requires DeepseekV4GGUFExperts, got "
+                "DeepSeek V4 expert LoRA requires DeepseekV4GgufExperts, got "
                 f"{type(experts).__name__}."
             )
         if experts.config._experts_implementation != EXPERTS_IMPLEMENTATION:
@@ -96,9 +96,9 @@ def deepseek_v4_gguf_mmq_aiter_lora_forward(
 ) -> torch.Tensor:
     """Run packed GGTensile base MMQ and AITER LoRA grouped MM."""
 
-    if not isinstance(self, DeepseekV4GGUFExperts):
+    if not isinstance(self, DeepseekV4GgufExperts):
         raise TypeError(
-            f"{EXPERTS_IMPLEMENTATION} requires DeepseekV4GGUFExperts, got {type(self).__name__}."
+            f"{EXPERTS_IMPLEMENTATION} requires DeepseekV4GgufExperts, got {type(self).__name__}."
         )
     return qwen3_5_moe_gguf_mmq_aiter_lora_forward(
         self,
@@ -147,5 +147,5 @@ def register_deepseek_v4_moe_lora(
     lora_config.__dict__["_aiter_expert_prior_counts"] = _bind_deepseek_expert_priors(
         model, expert_prior
     )
-    register({DeepseekV4GGUFExperts: DeepseekV4GGUFMoeLora})
+    register({DeepseekV4GgufExperts: DeepseekV4GgufMoeLora})
     return lora_config

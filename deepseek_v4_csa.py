@@ -1293,7 +1293,10 @@ def _producer_forward_kernel(
     variance = tl.sum(pooled * pooled, axis=0) / HEAD_DIM
     rms_inv = tl.rsqrt(variance + RMS_EPS)
     weight = tl.load(weight_ptr + d).to(tl.float32)
-    normed = (pooled * rms_inv * weight).to(tl.bfloat16).to(tl.float32)
+    # The FP32 normalization product flows into RoPE instead of emulating the
+    # reference RMSNorm's intermediate BF16 cast. The residual difference is
+    # bounded by the final BF16 store and covered by the producer accuracy gate.
+    normed = pooled * rms_inv * weight
     pairs = tl.arange(0, HEAD_DIM // 2)
     even, odd = tl.split(tl.reshape(normed, (HEAD_DIM // 2, 2)))
     rope_start_pair: tl.constexpr = (HEAD_DIM - 64) // 2
@@ -1974,7 +1977,6 @@ class _CSAAttentionFunction(torch.autograd.Function):
         output, lse, local_scores, compressed_scores = _attention_forward(
             query, local_kv, compressed_kv, sink
         )
-        ctx.set_materialize_grads(False)
         ctx.save_for_backward(
             query,
             local_kv,
@@ -1989,8 +1991,6 @@ class _CSAAttentionFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx: Any, grad_output):  # ty: ignore[invalid-method-override]
-        if grad_output is None:
-            return None, None, None, None
         (
             query,
             local_kv,
@@ -2144,15 +2144,12 @@ class _CSAProducerFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx: Any, kv, gate, bias, weight, cos, sin, rms_eps: float):
         output = _producer_forward(kv, gate, bias, weight, cos, sin, rms_eps)
-        ctx.set_materialize_grads(False)
         ctx.save_for_backward(kv, gate, bias, weight, cos, sin)
         ctx.rms_eps = float(rms_eps)
         return output
 
     @staticmethod
     def backward(ctx: Any, grad_output):  # ty: ignore[invalid-method-override]
-        if grad_output is None:
-            return (None,) * 7
         kv, gate, bias, weight, cos, sin = ctx.saved_tensors
         if grad_output.dtype != torch.bfloat16 or grad_output.stride(-1) != 1:
             raise ValueError(

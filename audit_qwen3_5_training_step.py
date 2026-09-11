@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-"""DeepSeek V4 full-step correctness, memory, gradient, and profiling audit."""
+"""Qwen3.5-MoE full-step correctness, memory, gradient, and profiling audit."""
 
 import argparse
 import gc
 import json
 import os
 import time
-from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
 
@@ -18,33 +17,20 @@ from transformers import AutoModelForCausalLM
 from transformers.integrations.gguf.gguf_quantized_parameter import (
     GgufQuantizedParameter,
 )
-from transformers.integrations.gguf.modules import GgufGroupedLinear
-from transformers.integrations.gguf.moe import DeepseekV4GgufExperts
-from transformers.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4DecoderLayer
+from transformers.integrations.gguf.modules import GgufLinear
+from transformers.integrations.gguf.moe import GgufExperts
+from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
+    Qwen3_5MoeDecoderLayer,
+)
 
-from deepseek_v4_attention import (
-    configure_deepseek_v4_attention,
-    require_complete_deepseek_v4_attention,
-)
-from deepseek_v4_liger_loss import apply_deepseek_v4_liger_loss
-from deepseek_v4_liger_mhc import (
-    configure_deepseek_v4_liger_mhc,
-    require_complete_deepseek_v4_liger_mhc,
-)
-from deepseek_v4_liger_rmsnorm import (
-    configure_deepseek_v4_liger_rmsnorm,
-    require_complete_deepseek_v4_liger_rmsnorm,
-)
-from deepseek_v4_lora import (
-    DEEPSEEK_V4_TARGET_MODULES_PATTERN,
-    audit_deepseek_v4_injection,
-    configure_deepseek_v4_grouped_mmq,
-    register_deepseek_v4_lora,
-)
-from deepseek_v4_moe_lora import DeepseekV4GgufMoeLora, register_deepseek_v4_moe_lora
-from deepseek_v4_profiler import profile_warmed_training_update
-from deepseek_v4_routing import DeepseekV4RouteCollector
+from attention_aiter_tuning import configure_qwen35_flash_attention_2
+from fast_lora import FastGgufLoraLinear, FastLoraLinear, register_fast_lora
+from fast_moe_lora import FastGgufMoeLora, register_fast_moe_lora
 from fast_moe_ranking import configure_fast_moe_ranking
+from fla_tuning import configure_qwen35_fla
+from gguf_dequant_compile import configure_compiled_gguf_dequantize
+from gguf_liger_loss import apply_gguf_liger_fused_linear_cross_entropy
+from qwen3_5_profiler import profile_warmed_training_update
 from training_audit import (
     accelerator_memory,
     audit_optimizer,
@@ -60,28 +46,44 @@ from training_audit import (
     validate_second_gradients,
 )
 
-EXPECTED_STATE_TENSORS = 1328
-EXPECTED_PACKED_PARAMETERS = 474
-EXPECTED_PACKED_BYTES = 84_512_276_480
-EXPECTED_GROUPED_LINEARS = 43
-EXPECTED_EXPERT_MODULES = 43
-EXPECTED_INTEGER_BUFFERS = 3
+EXPECTED_STATE_TENSORS = 733
+EXPECTED_LOGICAL_PARAMETERS = 34_660_610_688
+EXPECTED_PACKED_PARAMETERS = 432
+EXPECTED_PACKED_BYTES = 14_216_723_456
+EXPECTED_GGUF_LINEARS = 351
+EXPECTED_EXPERT_MODULES = 40
+EXPECTED_ORDINARY_WRAPPERS = 250
+EXPECTED_NATIVE_ORDINARY_WRAPPERS = 160
+EXPECTED_EXPERT_WRAPPERS = 40
+_GGUF_EXPERTS_TYPE = cast(type[Any], GgufExperts)
+TARGET_MODULES = [
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "down_proj",
+    "gate_proj",
+    "up_proj",
+    "in_proj_qkv",
+    "in_proj_z",
+    "out_proj",
+    "experts",
+]
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--model-dir", type=Path, default=Path("~/models/ds4").expanduser()
+        "--model-dir", type=Path, default=Path("~/models/qwen3.6").expanduser()
     )
-    parser.add_argument("--gguf-file", default="DeepSeek-V4-Flash-IQ2XXS.gguf")
+    parser.add_argument("--gguf-file", default="Qwen3.6-35B-A3B-APEX-I-Mini.gguf")
     parser.add_argument(
         "--dataset-dir",
         type=Path,
-        default=Path(__file__).resolve().parent / "data_tokenized_ds4",
+        default=Path(__file__).resolve().parent / "data_tokenized_qwen3.5",
     )
-    parser.add_argument("--output-dir", type=Path, default=Path("out_deepseek_v4"))
     parser.add_argument(
-        "--report-output", type=Path, default=Path("deepseek_v4_training_report.json")
+        "--report-output", type=Path, default=Path("qwen3_5_training_report.json")
     )
     parser.add_argument("--profile-output", type=Path)
     parser.add_argument("--batch-size", type=int, choices=(1, 4, 16), default=1)
@@ -94,7 +96,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--row-start", type=int, default=0)
     parser.add_argument("--seed", type=int, default=19_260_817)
-    parser.add_argument("--save-adapter", action="store_true")
     return parser.parse_args()
 
 
@@ -102,66 +103,115 @@ def audit_loaded_model(
     model: torch.nn.Module, loading_info: dict[str, Any]
 ) -> dict[str, Any]:
     packed = [
-        (name, parameter)
-        for name, parameter in model.named_parameters()
+        parameter
+        for parameter in model.parameters()
         if isinstance(parameter, GgufQuantizedParameter)
     ]
-    grouped = sum(isinstance(module, GgufGroupedLinear) for module in model.modules())
-    experts = sum(
-        isinstance(module, DeepseekV4GgufExperts) for module in model.modules()
-    )
-    integer_buffers = [
-        (name, buffer)
-        for name, buffer in model.named_buffers()
-        if not buffer.is_floating_point()
-    ]
-    packed_bytes = sum(
-        parameter.numel() * parameter.element_size() for _, parameter in packed
-    )
-    cleaned = clean_loading_info(loading_info)
-    errors = []
-    for key in ("missing_keys", "unexpected_keys", "mismatched_keys", "error_msgs"):
-        if loading_info.get(key):
-            errors.append(f"{key}={loading_info[key]}")
     observed = {
         "state_tensors": len(model.state_dict()),
+        "logical_parameters": sum(
+            parameter.logical_numel
+            if isinstance(parameter, GgufQuantizedParameter)
+            else parameter.numel()
+            for parameter in model.parameters()
+        ),
         "packed_parameters": len(packed),
-        "packed_bytes": packed_bytes,
-        "grouped_linears": grouped,
-        "expert_modules": experts,
-        "integer_buffers": len(integer_buffers),
+        "packed_bytes": sum(parameter.numel() for parameter in packed),
+        "gguf_linears": sum(
+            isinstance(module, GgufLinear) for module in model.modules()
+        ),
+        "expert_modules": sum(
+            isinstance(module, _GGUF_EXPERTS_TYPE) for module in model.modules()
+        ),
     }
     expected = {
         "state_tensors": EXPECTED_STATE_TENSORS,
+        "logical_parameters": EXPECTED_LOGICAL_PARAMETERS,
         "packed_parameters": EXPECTED_PACKED_PARAMETERS,
         "packed_bytes": EXPECTED_PACKED_BYTES,
-        "grouped_linears": EXPECTED_GROUPED_LINEARS,
+        "gguf_linears": EXPECTED_GGUF_LINEARS,
         "expert_modules": EXPECTED_EXPERT_MODULES,
-        "integer_buffers": EXPECTED_INTEGER_BUFFERS,
     }
-    for key, value in expected.items():
-        if observed[key] != value:
-            errors.append(f"{key}: expected {value}, found {observed[key]}")
+    errors = [
+        f"{key}: expected {value}, found {observed[key]}"
+        for key, value in expected.items()
+        if observed[key] != value
+    ]
+    for key in ("missing_keys", "unexpected_keys", "mismatched_keys", "error_msgs"):
+        if loading_info.get(key):
+            errors.append(f"{key}={loading_info[key]}")
+    outside_cuda = [
+        name
+        for name, tensor in (*model.named_parameters(), *model.named_buffers())
+        if tensor.device.type != "cuda"
+    ]
+    if outside_cuda:
+        errors.append(f"model tensors outside cuda:0: {outside_cuda[:8]}")
+    if errors:
+        raise RuntimeError("Qwen3.5 load audit failed: " + "; ".join(errors))
+    return observed | {"loading_info": clean_loading_info(loading_info)}
+
+
+def audit_adapter_injection(model: torch.nn.Module) -> dict[str, Any]:
+    ordinary = [
+        module for module in model.modules() if isinstance(module, FastLoraLinear)
+    ]
+    native = [
+        module
+        for module in ordinary
+        if isinstance(module, FastGgufLoraLinear)
+        and module.base_layer.input_permutation is None
+        and module.base_layer.output_permutation is None
+    ]
+    experts = [
+        module for module in model.modules() if isinstance(module, FastGgufMoeLora)
+    ]
+    trainable = [
+        (name, parameter)
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad
+    ]
+    errors = []
+    counts = {
+        "ordinary_wrappers": len(ordinary),
+        "native_ordinary_wrappers": len(native),
+        "expert_wrappers": len(experts),
+        "trainable_tensors": len(trainable),
+        "trainable_parameters": sum(parameter.numel() for _, parameter in trainable),
+    }
+    expected = {
+        "ordinary_wrappers": EXPECTED_ORDINARY_WRAPPERS,
+        "native_ordinary_wrappers": EXPECTED_NATIVE_ORDINARY_WRAPPERS,
+        "expert_wrappers": EXPECTED_EXPERT_WRAPPERS,
+    }
+    errors.extend(
+        f"{key}: expected {value}, found {counts[key]}"
+        for key, value in expected.items()
+        if counts[key] != value
+    )
+    invalid = [name for name, _ in trainable if ".lora_" not in name]
+    non_bf16 = [
+        name for name, parameter in trainable if parameter.dtype != torch.bfloat16
+    ]
     non_cuda = [
+        name for name, parameter in trainable if parameter.device.type != "cuda"
+    ]
+    packed_trainable = [
         name
         for name, parameter in model.named_parameters()
-        if parameter.device.type != "cuda"
+        if isinstance(parameter, GgufQuantizedParameter) and parameter.requires_grad
     ]
-    non_cuda += [
-        name for name, buffer in model.named_buffers() if buffer.device.type != "cuda"
-    ]
+    if invalid:
+        errors.append(f"non-adapter trainable tensors: {invalid[:8]}")
+    if non_bf16:
+        errors.append(f"non-BF16 adapters: {non_bf16[:8]}")
     if non_cuda:
-        errors.append(f"model tensors outside cuda:0: {non_cuda[:8]}")
+        errors.append(f"adapters outside cuda:0: {non_cuda[:8]}")
+    if packed_trainable:
+        errors.append(f"trainable packed parameters: {packed_trainable[:8]}")
     if errors:
-        raise RuntimeError("DeepSeek V4 load audit failed: " + "; ".join(errors))
-    get_memory_footprint = cast(
-        Callable[[], int], cast(Any, model).get_memory_footprint
-    )
-    return observed | {
-        "loading_info": cleaned,
-        "model_footprint_bytes": get_memory_footprint(),
-        "integer_buffer_paths": [name for name, _ in integer_buffers],
-    }
+        raise RuntimeError("Qwen3.5 adapter audit failed: " + "; ".join(errors))
+    return counts | {"adapter_dtypes": ["torch.bfloat16"], "device": "cuda:0"}
 
 
 def load_fixed_batch(
@@ -173,14 +223,15 @@ def load_fixed_batch(
 ) -> tuple[Dataset, dict[str, torch.Tensor], dict[str, Any]]:
     if sequence_length <= 1 or sequence_length > 2048:
         raise ValueError(
-            "The fixed DeepSeek dataset supports sequence lengths in [2,2048]."
+            "The fixed Qwen dataset supports sequence lengths in [2,2048]."
         )
     dataset = load_from_disk(str(dataset_dir))
     if not isinstance(dataset, Dataset):
         raise TypeError(f"expected a Dataset at {dataset_dir}, got DatasetDict")
     if row_start < 0 or row_start + batch_size > len(dataset):
         raise IndexError(
-            f"requested rows [{row_start},{row_start + batch_size}) outside dataset of {len(dataset)} rows"
+            f"requested rows [{row_start},{row_start + batch_size}) outside "
+            f"dataset of {len(dataset)} rows"
         )
     selected = dataset.select(range(row_start, row_start + batch_size))
     rows = [selected[index] for index in range(batch_size)]
@@ -194,16 +245,11 @@ def load_fixed_batch(
         device=input_ids.device,
     )
     positions = torch.arange(sequence_length, device=input_ids.device).unsqueeze(0)
-    valid_tokens = positions < valid_lengths.unsqueeze(1)
-    attention_mask = torch.ones_like(input_ids)
-    labels = input_ids.masked_fill(~valid_tokens, -100)
+    attention_mask = (positions < valid_lengths.unsqueeze(1)).long()
+    labels = input_ids.masked_fill(attention_mask == 0, -100)
     return (
         selected,
-        {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "labels": labels,
-        },
+        {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels},
         {
             "dataset_rows": len(dataset),
             "selected_rows": list(range(row_start, row_start + batch_size)),
@@ -213,11 +259,20 @@ def load_fixed_batch(
     )
 
 
+def validate_loss_output(output: Any, label: str) -> None:
+    if getattr(output, "logits", None) is not None:
+        raise RuntimeError(f"{label} materialized full logits")
+    if getattr(output, "aux_loss", None) is not None:
+        raise RuntimeError(f"{label} retained router auxiliary loss")
+    loss = getattr(output, "loss", None)
+    if loss is None or not bool(torch.isfinite(loss).item()):
+        raise RuntimeError(f"{label} produced a missing or nonfinite loss")
+
+
 def main() -> None:
     args = parse_args()
     if args.max_steps < 1:
         raise ValueError("--max-steps must be positive")
-
     args.report_output.parent.mkdir(parents=True, exist_ok=True)
     report: dict[str, Any] = {
         "status": "running",
@@ -240,9 +295,12 @@ def main() -> None:
         args.report_output.write_text(json.dumps(report, indent=2) + "\n")
 
     persist()
-    model = None
-    collector = DeepseekV4RouteCollector()
     torch.manual_seed(args.seed)
+    report["static_configuration"] = {
+        "compiled_gguf_dequant": configure_compiled_gguf_dequantize(),
+        "flash_attention": configure_qwen35_flash_attention_2(),
+        "fla_cache_entries": configure_qwen35_fla(),
+    }
 
     def load_model():
         return AutoModelForCausalLM.from_pretrained(
@@ -252,7 +310,7 @@ def main() -> None:
             local_files_only=True,
             dtype=torch.bfloat16,
             device_map={"": "cuda:0"},
-            attn_implementation="eager",
+            attn_implementation="flash_attention_2",
             output_loading_info=True,
         )
 
@@ -260,26 +318,14 @@ def main() -> None:
     model.config.use_cache = False
     model.config.output_router_logits = False
     model.config.router_aux_loss_coef = 0.0
-    report["attention"] = configure_deepseek_v4_attention(model)
-    require_complete_deepseek_v4_attention(report["attention"])
     report["router"] = configure_fast_moe_ranking(model)
-    report["grouped_mmq"] = configure_deepseek_v4_grouped_mmq(model)
-    if report["grouped_mmq"]["enabled"] != 43:
-        raise RuntimeError(
-            "expected 43 native DeepSeek grouped output-A projections, found "
-            f"{report['grouped_mmq']['enabled']}"
-        )
-    report["liger_rmsnorm"] = configure_deepseek_v4_liger_rmsnorm(model)
-    require_complete_deepseek_v4_liger_rmsnorm(report["liger_rmsnorm"])
-    report["liger_mhc"] = configure_deepseek_v4_liger_mhc(model)
-    require_complete_deepseek_v4_liger_mhc(report["liger_mhc"])
     report["load_audit"] = audit_loaded_model(model, loading_info)
     report["memory_after_load"] = memory_snapshot()
     persist()
 
     lora_config = LoraConfig(
         task_type=TaskType.CAUSAL_LM,
-        target_modules=DEEPSEEK_V4_TARGET_MODULES_PATTERN,
+        target_modules=TARGET_MODULES,
         r=args.rank,
         lora_alpha=args.alpha,
         lora_dropout=0.0,
@@ -289,20 +335,14 @@ def main() -> None:
     )
 
     def inject_adapters():
-        register_deepseek_v4_lora(lora_config)
-        register_deepseek_v4_moe_lora(
-            lora_config, model, expert_prior="deepseek-learned"
-        )
+        register_fast_lora(lora_config)
+        register_fast_moe_lora(lora_config, model, expert_prior="qwen-learned")
         wrapped = get_peft_model(model, lora_config, autocast_adapter_dtype=False)
-        apply_deepseek_v4_liger_loss(wrapped)
+        apply_gguf_liger_fused_linear_cross_entropy(wrapped)
         return wrapped
 
     model = run_phase(report["timeline"], "adapter_injection", inject_adapters)
-    report["injection_audit"] = audit_deepseek_v4_injection(
-        model,
-        expert_wrapper_type=DeepseekV4GgufMoeLora,
-        rank=args.rank,
-    )
+    report["injection_audit"] = audit_adapter_injection(model)
     initial_b = [
         torch.count_nonzero(parameter.detach())
         for name, parameter in model.named_parameters()
@@ -314,9 +354,7 @@ def main() -> None:
         torch.count_nonzero(initial_b_nonzero)
     )
     if bool(torch.any(initial_b_nonzero).item()):
-        raise RuntimeError(
-            "LoRA-B factors must be zero-initialized before the first update"
-        )
+        raise RuntimeError("LoRA-B factors must be zero-initialized")
     model.gradient_checkpointing_enable(
         gradient_checkpointing_kwargs={"use_reentrant": False}
     )
@@ -324,11 +362,10 @@ def main() -> None:
     model.train()
     report["checkpointing"] = audit_training_contract(
         model,
-        decoder_type=DeepseekV4DecoderLayer,
-        expected_layers=43,
+        decoder_type=Qwen3_5MoeDecoderLayer,
+        expected_layers=40,
     ) | {"policy": "per_decoder_layer"}
     report["memory_after_adapters"] = memory_snapshot()
-    persist()
 
     selected_dataset, batch, data_report = load_fixed_batch(
         args.dataset_dir,
@@ -350,38 +387,23 @@ def main() -> None:
     report["memory_after_optimizer_create"] = memory_snapshot()
     packed_before = representative_packed_state(model)
     report["packed_before"] = packed_before
-    report["route_validation_policy"] = {
-        "expert_identity": "implementation_defined_near_ties",
-        "correctness_metric": "sorted_selected_routing_weights",
-        "sample_rows_per_summary": 256,
-    }
-    collector.install(model)
+    persist()
 
+    require_complete = args.sequence_length == 2048
     optimizer.zero_grad(set_to_none=True)
-    collector.clear()
-    output = run_phase(
-        report["timeline"],
-        "first_forward",
-        lambda: model(**batch, use_cache=False),
+    first_output = run_phase(
+        report["timeline"], "first_forward", lambda: model(**batch, use_cache=False)
     )
-    if output.logits is not None or output.aux_loss is not None:
-        raise RuntimeError(
-            "scoped training loss must return logits=None and aux_loss=None"
-        )
-    if output.loss is None or not bool(torch.isfinite(output.loss).item()):
-        raise RuntimeError("first loss is missing or nonfinite")
-    first_loss = float(output.loss.detach())
-    run_phase(report["timeline"], "first_backward", output.loss.backward)
+    validate_loss_output(first_output, "first forward")
+    first_loss = float(first_output.loss.detach())
+    run_phase(report["timeline"], "first_backward", first_output.loss.backward)
     first_gradients = summarize_gradients(model, "first_backward")
+    validate_first_gradients(first_gradients, require_complete=require_complete)
     report["first_backward"] = {
         "loss": first_loss,
         "gradients": first_gradients,
-        "routes": collector.summaries(),
     }
-    persist()
-    require_complete = args.sequence_length == 2048
-    validate_first_gradients(first_gradients, require_complete=require_complete)
-    del output
+    del first_output
 
     clip_norm = run_phase(
         report["timeline"],
@@ -395,87 +417,62 @@ def main() -> None:
         raise RuntimeError("gradient clipping returned a nonfinite norm")
     report["clip_norm_before"] = float(clip_norm)
     run_phase(report["timeline"], "optimizer_step", optimizer.step)
-    updates = summarize_b_updates(model)
+    first_update = summarize_b_updates(model)
     expected_unchanged = {
         name for name in first_gradients["missing"] if ".lora_B" in name
     }
-    if set(updates["unchanged"]) != expected_unchanged:
+    if set(first_update["unchanged"]) != expected_unchanged:
+        raise RuntimeError("LoRA-B update coverage differs from gradient coverage")
+    if require_complete and first_update["changed_tensors"] != first_update["tensors"]:
         raise RuntimeError(
-            "LoRA-B update coverage differs from the first backward's missing branches: "
-            f"unchanged={updates['unchanged'][:8]}, expected={sorted(expected_unchanged)[:8]}"
+            f"some LoRA-B tensors did not update: {first_update['unchanged'][:8]}"
         )
-    if require_complete and updates["changed_tensors"] != updates["tensors"]:
-        raise RuntimeError(
-            f"some LoRA-B tensors did not update: {updates['unchanged'][:8]}"
-        )
-    report["first_update"] = updates
+    report["first_update"] = first_update
+    persist()
+
     optimizer.zero_grad(set_to_none=True)
     gc.collect()
-
-    collector.clear()
-    output = run_phase(
-        report["timeline"],
-        "second_forward",
-        lambda: model(**batch, use_cache=False),
+    second_output = run_phase(
+        report["timeline"], "second_forward", lambda: model(**batch, use_cache=False)
     )
-    if output.logits is not None or output.aux_loss is not None:
-        raise RuntimeError(
-            "second scoped loss must return logits=None and aux_loss=None"
-        )
-    if output.loss is None or not bool(torch.isfinite(output.loss).item()):
-        raise RuntimeError("second loss is missing or nonfinite")
-    second_loss = float(output.loss.detach())
-    run_phase(report["timeline"], "second_backward", output.loss.backward)
+    validate_loss_output(second_output, "second forward")
+    second_loss = float(second_output.loss.detach())
+    run_phase(report["timeline"], "second_backward", second_output.loss.backward)
     second_gradients = summarize_gradients(model, "second_backward")
+    validate_second_gradients(second_gradients, require_complete=require_complete)
     report["second_backward"] = {
         "loss": second_loss,
         "gradients": second_gradients,
-        "routes": collector.summaries(),
     }
-    persist()
-    validate_second_gradients(second_gradients, require_complete=require_complete)
-    del output
+    del second_output
 
     packed_after = representative_packed_state(model)
     report["packed_after"] = packed_after
     if packed_before != packed_after:
-        raise RuntimeError(
-            "representative packed payload identity, version, or checksum changed"
-        )
-    grouped_gradients = [
-        name
-        for name, module in model.named_modules()
-        if isinstance(module, GgufGroupedLinear) and module.weight.grad is not None
-    ]
-    if grouped_gradients:
-        raise RuntimeError(
-            f"frozen grouped o_a_proj weights received gradients: {grouped_gradients[:8]}"
-        )
-    report["grouped_output_gradients"] = grouped_gradients
-    report["memory_after_gate"] = memory_snapshot()
+        raise RuntimeError("representative packed payload identity or checksum changed")
+    report["memory_after_gradient_gate"] = memory_snapshot()
     persist()
 
-    optimizer.zero_grad(set_to_none=True)
-    collector.remove()
-
     def complete_update(label: str) -> dict[str, Any]:
-        phase_times = {}
         optimizer.zero_grad(set_to_none=True)
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        phase_times: dict[str, Any] = {}
+
         started = time.perf_counter()
         with torch.autograd.profiler.record_function("training_phase/forward"):
-            step_output = model(**batch, use_cache=False)
+            output = model(**batch, use_cache=False)
         torch.cuda.synchronize()
         phase_times["forward_seconds"] = time.perf_counter() - started
-        if step_output.logits is not None or not bool(
-            torch.isfinite(step_output.loss).item()
-        ):
-            raise RuntimeError(f"{label} produced invalid scoped loss output")
-        backward_started = time.perf_counter()
+        validate_loss_output(output, label)
+
+        started = time.perf_counter()
         with torch.autograd.profiler.record_function("training_phase/backward"):
-            step_output.loss.backward()
+            output.loss.backward()
         torch.cuda.synchronize()
-        phase_times["backward_seconds"] = time.perf_counter() - backward_started
-        clip_started = time.perf_counter()
+        phase_times["backward_seconds"] = time.perf_counter() - started
+
+        started = time.perf_counter()
         with torch.autograd.profiler.record_function("training_phase/gradient_clip"):
             norm = torch.nn.utils.clip_grad_norm_(
                 [
@@ -486,20 +483,22 @@ def main() -> None:
                 args.max_grad_norm,
             )
         torch.cuda.synchronize()
-        phase_times["clip_seconds"] = time.perf_counter() - clip_started
+        phase_times["clip_seconds"] = time.perf_counter() - started
         if not bool(torch.isfinite(norm).item()):
             raise RuntimeError(f"{label} clipping norm is nonfinite")
-        step_started = time.perf_counter()
+
+        started = time.perf_counter()
         with torch.autograd.profiler.record_function("training_phase/optimizer"):
             optimizer.step()
         torch.cuda.synchronize()
-        phase_times["optimizer_seconds"] = time.perf_counter() - step_started
-        phase_times["loss"] = float(step_output.loss.detach())
+        phase_times["optimizer_seconds"] = time.perf_counter() - started
+        phase_times["loss"] = float(output.loss.detach())
         phase_times["clip_norm"] = float(norm)
         phase_times["memory"] = accelerator_memory()
-        del step_output
+        del output
         return phase_times
 
+    optimizer.zero_grad(set_to_none=True)
     for step in range(1, args.max_steps):
         report.setdefault("extra_steps", []).append(
             complete_update(f"extra_step_{step}")
@@ -516,25 +515,14 @@ def main() -> None:
                 "sequence_length": args.sequence_length,
                 "rank": args.rank,
                 "checkpointing": report["checkpointing"],
-                "route_distributions": report["second_backward"]["routes"],
             },
         )
-        persist()
-
-    if args.save_adapter:
-        args.output_dir.mkdir(parents=True, exist_ok=True)
-        run_phase(
-            report["timeline"],
-            "save_adapter",
-            lambda: model.save_pretrained(args.output_dir),
-        )
-        report["adapter_output"] = str(args.output_dir)
 
     del selected_dataset
     report["status"] = "passed"
     report["memory_final"] = memory_snapshot()
     persist()
-    print(f"DEEPSEEK V4 GATE PASS: {args.report_output}", flush=True)
+    print(f"QWEN3.5 GATE PASS: {args.report_output}", flush=True)
 
 
 if __name__ == "__main__":

@@ -703,9 +703,9 @@ class _DeepseekV4MHCPrepareFunction(torch.autograd.Function):
     @staticmethod
     def backward(  # ty: ignore[invalid-method-override]
         ctx: Any,
-        grad_residual: torch.Tensor | None,
-        grad_coeff: torch.Tensor | None,
-        grad_collapsed: torch.Tensor | None,
+        grad_residual: torch.Tensor,
+        grad_coeff: torch.Tensor,
+        grad_collapsed: torch.Tensor,
     ) -> tuple[torch.Tensor | None, ...]:
         if torch.is_grad_enabled():
             raise RuntimeError(
@@ -714,24 +714,9 @@ class _DeepseekV4MHCPrepareFunction(torch.autograd.Function):
         x, fn, scale, mix, invr, coeff, sink_state = ctx.saved_tensors
         x_shape, hc_eps = ctx.meta
         rows = x.numel() // _FLAT
-        if grad_residual is None:
-            grad_residual = torch.zeros_like(x)
-        elif not grad_residual.is_contiguous():
-            grad_residual = grad_residual.contiguous()
-        if grad_coeff is None:
-            grad_coeff = torch.zeros_like(coeff)
-        else:
-            grad_coeff = grad_coeff.reshape(rows, _MIX)
-            if not grad_coeff.is_contiguous():
-                grad_coeff = grad_coeff.contiguous()
-        if grad_collapsed is None:
-            grad_collapsed = torch.zeros(
-                (rows, _HIDDEN), device=x.device, dtype=x.dtype
-            )
-        else:
-            grad_collapsed = grad_collapsed.reshape(rows, _HIDDEN)
-            if not grad_collapsed.is_contiguous():
-                grad_collapsed = grad_collapsed.contiguous()
+        grad_residual = grad_residual.contiguous()
+        grad_coeff = grad_coeff.reshape(rows, _MIX).contiguous()
+        grad_collapsed = grad_collapsed.reshape(rows, _HIDDEN).contiguous()
 
         grad_mix = torch.empty_like(mix)
         controls_block_d, controls_warps, controls_stages = _CONTROLS_BACKWARD_CONFIGS[
@@ -815,8 +800,7 @@ class _DeepseekV4MHCMergeFunction(torch.autograd.Function):
             )
         residual, branch_output, coeff = ctx.saved_tensors
         rows = residual.numel() // _FLAT
-        if not grad_output.is_contiguous():
-            grad_output = grad_output.contiguous()
+        grad_output = grad_output.contiguous()
         # The incoming cotangent is dead at the fixed DeepSeek layer boundary.
         # Reuse it for direct dResidual, then let prepare backward add the other
         # activation-gradient contributions into the same storage.
@@ -896,9 +880,7 @@ class _DeepseekV4MHCHeadFunction(torch.autograd.Function):
         x, fn, scale, mix, invr, pre = ctx.saved_tensors
         x_shape, hc_eps = ctx.meta
         rows = x.numel() // _FLAT
-        grad_output = grad_output.reshape(rows, _HIDDEN)
-        if not grad_output.is_contiguous():
-            grad_output = grad_output.contiguous()
+        grad_output = grad_output.reshape(rows, _HIDDEN).contiguous()
         grad_x = torch.empty_like(x)
         block_k, block_d, num_warps, num_stages = _HEAD_BACKWARD_CONFIGS[rows]
         _mhc_head_backward_kernel[(rows,)](
