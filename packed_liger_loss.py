@@ -375,8 +375,6 @@ def packed_q8_liger_for_causal_lm_loss(
         raise RuntimeError(f"{loss_name} supports only FP32 internal accumulation.")
     if not isinstance(lm_head.weight, GgufQuantizedParameter):
         raise TypeError(f"{loss_name} requires a GgufQuantizedParameter weight.")
-    if lm_head.input_permutation is not None or lm_head.output_permutation is not None:
-        raise RuntimeError(f"{loss_name} does not support layout permutations.")
     if lm_head.compute_dtype != torch.bfloat16:
         raise RuntimeError(f"{loss_name} requires BF16 compute_dtype.")
     if lm_head.in_features != hidden_size or hidden_states.shape[-1] != hidden_size:

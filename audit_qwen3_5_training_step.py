@@ -53,6 +53,9 @@ EXPECTED_PACKED_BYTES = 14_216_723_456
 EXPECTED_GGUF_LINEARS = 351
 EXPECTED_EXPERT_MODULES = 40
 EXPECTED_ORDINARY_WRAPPERS = 250
+# 250 ordinary wrappers = 160 attention/MLP projections on the native dense MMQ path plus the 90
+# GatedDeltaNet projections (`in_proj_qkv`, `in_proj_z`, `out_proj`) that keep the generic
+# compiled-dequant base forward.
 EXPECTED_NATIVE_ORDINARY_WRAPPERS = 160
 EXPECTED_EXPERT_WRAPPERS = 40
 _GGUF_EXPERTS_TYPE = cast(type[Any], GgufExperts)
@@ -159,9 +162,7 @@ def audit_adapter_injection(model: torch.nn.Module) -> dict[str, Any]:
     native = [
         module
         for module in ordinary
-        if isinstance(module, FastGgufLoraLinear)
-        and module.base_layer.input_permutation is None
-        and module.base_layer.output_permutation is None
+        if isinstance(module, FastGgufLoraLinear) and module.uses_packed_mmq()
     ]
     experts = [
         module for module in model.modules() if isinstance(module, FastGgufMoeLora)
@@ -325,7 +326,7 @@ def main() -> None:
     )
 
     def inject_adapters():
-        register_fast_lora(lora_config)
+        register_fast_lora(lora_config, model)
         register_fast_moe_lora(lora_config, model, expert_prior="qwen-learned")
         wrapped = get_peft_model(model, lora_config, autocast_adapter_dtype=False)
         apply_gguf_liger_fused_linear_cross_entropy(wrapped)

@@ -105,10 +105,6 @@ def _deepseek_v4_fixed_grouped_mmq_forward(
     original_input_dtype = input.dtype
     if self.compute_dtype != torch.bfloat16:
         raise RuntimeError("DeepSeek fixed grouped MMQ requires BF16 compute_dtype.")
-    if self.input_permutation is not None or self.output_permutation is not None:
-        raise RuntimeError(
-            "DeepSeek fixed grouped MMQ does not support layout permutations."
-        )
 
     compute_input = input.to(self.compute_dtype)
     compute_input = compute_input.contiguous()

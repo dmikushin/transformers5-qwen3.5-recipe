@@ -23,6 +23,24 @@ from transformers.integrations.gguf.gguf_quantized_parameter import (
 )
 from transformers.integrations.gguf.modules import GgufLinear
 
+GENERIC_PACKED_FORWARD_SUFFIXES = (
+    ".linear_attn.in_proj_qkv",
+    ".linear_attn.in_proj_z",
+    ".linear_attn.out_proj",
+)
+_GENERIC_PACKED_FORWARD_ATTR = "_generic_packed_forward"
+
+
+def uses_generic_packed_forward(name: str) -> bool:
+    """Whether a packed ordinary projection must stay on the generic base forward.
+
+    Matched by module name because the GGUF runtime applies those reorders to the packed
+    payload without leaving a per-module marker, and geometry alone cannot separate e.g.
+    `linear_attn.in_proj_qkv` from `q_proj`, which share a logical shape.
+    """
+
+    return f".{name}".endswith(GENERIC_PACKED_FORWARD_SUFFIXES)
+
 
 def _fused_lora_add(
     result: torch.Tensor,
@@ -120,19 +138,34 @@ class FastLoraLinear(_FastLoraForwardMixin, PeftLinear):
 class FastGgufLoraLinear(FastLoraLinear):
     """Fast LoRA wrapper for frozen packed ``GgufLinear`` modules.
 
-    Unpermuted packed weights use exported dense MMQ in both directions.
-    Kernel support is authoritative in ``torch-ggml-ops`` and is not probed here.
+    Permutation-free packed weights of ordinary projections use exported dense MMQ in both
+    directions. Fused recurrent projections and modules with a runtime layout permutation use
+    the generic compiled-dequant base forward. Kernel support is authoritative in
+    ``torch-ggml-ops`` and is not probed here.
     """
+
+    def packed_mmq_weight(self) -> GgufQuantizedParameter | None:
+        """The packed base weight when this wrapper may use the dense MMQ path."""
+
+        base = self.base_layer
+        weight = base.weight
+        if not isinstance(weight, GgufQuantizedParameter) or getattr(
+            base, _GENERIC_PACKED_FORWARD_ATTR, False
+        ):
+            return None
+        return weight
+
+    def uses_packed_mmq(self) -> bool:
+        """Whether this wrapper may call the native dense packed MMQ path."""
+
+        return self.packed_mmq_weight() is not None
 
     def _base_layer_forward(
         self, x: torch.Tensor, *args: Any, **kwargs: Any
     ) -> torch.Tensor:
         base = self.base_layer
-        if (
-            not isinstance(base.weight, GgufQuantizedParameter)
-            or base.input_permutation is not None
-            or base.output_permutation is not None
-        ):
+        weight = self.packed_mmq_weight()
+        if weight is None:
             return base(x, *args, **kwargs)
         if args or kwargs:
             raise TypeError(
@@ -143,11 +176,11 @@ class FastGgufLoraLinear(FastLoraLinear):
                 "The packed GGUF MMQ linear path requires BF16 compute_dtype."
             )
 
-        payload = base.weight.as_subclass(torch.Tensor)
+        payload = weight.as_subclass(torch.Tensor)
         result = mmq(
             x,
             payload,
-            int(base.weight.quant_type),
+            int(weight.quant_type),
             base.out_features,
         )
         if base.bias is not None:
@@ -167,12 +200,15 @@ class FastGgufLoraLinear(FastLoraLinear):
         )
 
 
-def register_fast_lora(lora_config: LoraConfig) -> LoraConfig:
+def register_fast_lora(lora_config: LoraConfig, model: torch.nn.Module) -> LoraConfig:
     """Register fast ordinary-linear wrappers on one ``LoraConfig``.
 
     PEFT currently exposes custom LoRA modules through the experimental private
     ``LoraConfig._register_custom_module`` API. Registration is config-local:
     no PEFT or Transformers class is monkey-patched process-wide.
+
+    ``model`` is marked for the projections that must keep the generic packed
+    base forward. The wrapper reads that mark when it picks its path.
     """
 
     register = getattr(lora_config, "_register_custom_module", None)
@@ -181,6 +217,10 @@ def register_fast_lora(lora_config: LoraConfig) -> LoraConfig:
             "This PEFT version has no LoraConfig._register_custom_module API. "
             "Cannot install fast LoRA without a global monkey patch."
         )
+
+    for name, module in model.named_modules():
+        if uses_generic_packed_forward(name):
+            setattr(module, _GENERIC_PACKED_FORWARD_ATTR, True)
 
     # GgufLinear subclasses nn.Linear, so its merge-safe wrapper must be checked first.
     register(
