@@ -6,8 +6,16 @@ from typing import Any
 
 import torch
 
-from training_profiler import module_ranges
+from training_profiler import lora_module_category, module_ranges
 from training_profiler import profile_warmed_training_update as _profile
+
+_PACKED_LORA_CLASSES = frozenset({"DeepseekV4GgufLoraLinear"})
+_GENERIC_LORA_CLASSES = frozenset({"DeepseekV4LoraLinear"})
+_EXPERT_LORA_CLASSES = frozenset({"DeepseekV4GgufMoeLora"})
+_LORA_ROLE_FRAGMENTS = (
+    (".shared_experts.", "shared_expert"),
+    (".o_b_proj", "output_b"),
+)
 
 
 def _module_category(name: str, module: torch.nn.Module) -> str | None:
@@ -24,15 +32,14 @@ def _module_category(name: str, module: torch.nn.Module) -> str | None:
         return "attention"
     if class_name == "GgufGroupedLinear":
         return "grouped_output_a"
-    if class_name == "DeepseekV4GgufMoeLora":
-        return "routed_experts"
-    if class_name in {"DeepseekV4GgufLoraLinear", "DeepseekV4LoraLinear"}:
-        if ".shared_experts." in name:
-            return "shared_expert"
-        if name.endswith(".o_b_proj"):
-            return "output_b"
-        return "ordinary_lora"
-    return None
+    return lora_module_category(
+        name,
+        class_name,
+        packed_lora_classes=_PACKED_LORA_CLASSES,
+        generic_lora_classes=_GENERIC_LORA_CLASSES,
+        expert_lora_classes=_EXPERT_LORA_CLASSES,
+        role_fragments=_LORA_ROLE_FRAGMENTS,
+    )
 
 
 def deepseek_v4_module_ranges(model: torch.nn.Module):

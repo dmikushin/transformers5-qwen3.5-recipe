@@ -5,7 +5,6 @@ import argparse
 import gc
 import json
 import os
-import time
 from pathlib import Path
 from typing import Any, cast
 
@@ -32,10 +31,10 @@ from gguf_dequant_compile import configure_compiled_gguf_dequantize
 from gguf_liger_loss import apply_gguf_liger_fused_linear_cross_entropy
 from qwen3_5_profiler import profile_warmed_training_update
 from training_audit import (
-    accelerator_memory,
     audit_optimizer,
     audit_training_contract,
     clean_loading_info,
+    complete_training_update,
     memory_snapshot,
     representative_packed_state,
     run_phase,
@@ -43,6 +42,7 @@ from training_audit import (
     summarize_gradients,
     summarize_timeline,
     validate_first_gradients,
+    validate_loss_output,
     validate_second_gradients,
 )
 
@@ -259,16 +259,6 @@ def load_fixed_batch(
     )
 
 
-def validate_loss_output(output: Any, label: str) -> None:
-    if getattr(output, "logits", None) is not None:
-        raise RuntimeError(f"{label} materialized full logits")
-    if getattr(output, "aux_loss", None) is not None:
-        raise RuntimeError(f"{label} retained router auxiliary loss")
-    loss = getattr(output, "loss", None)
-    if loss is None or not bool(torch.isfinite(loss).item()):
-        raise RuntimeError(f"{label} produced a missing or nonfinite loss")
-
-
 def main() -> None:
     args = parse_args()
     if args.max_steps < 1:
@@ -454,51 +444,14 @@ def main() -> None:
     persist()
 
     def complete_update(label: str) -> dict[str, Any]:
-        optimizer.zero_grad(set_to_none=True)
-        torch.cuda.synchronize()
-        torch.cuda.reset_peak_memory_stats()
-        phase_times: dict[str, Any] = {}
+        return complete_training_update(
+            model,
+            optimizer,
+            batch,
+            label=label,
+            max_grad_norm=args.max_grad_norm,
+        )
 
-        started = time.perf_counter()
-        with torch.autograd.profiler.record_function("training_phase/forward"):
-            output = model(**batch, use_cache=False)
-        torch.cuda.synchronize()
-        phase_times["forward_seconds"] = time.perf_counter() - started
-        validate_loss_output(output, label)
-
-        started = time.perf_counter()
-        with torch.autograd.profiler.record_function("training_phase/backward"):
-            output.loss.backward()
-        torch.cuda.synchronize()
-        phase_times["backward_seconds"] = time.perf_counter() - started
-
-        started = time.perf_counter()
-        with torch.autograd.profiler.record_function("training_phase/gradient_clip"):
-            norm = torch.nn.utils.clip_grad_norm_(
-                [
-                    parameter
-                    for parameter in model.parameters()
-                    if parameter.requires_grad
-                ],
-                args.max_grad_norm,
-            )
-        torch.cuda.synchronize()
-        phase_times["clip_seconds"] = time.perf_counter() - started
-        if not bool(torch.isfinite(norm).item()):
-            raise RuntimeError(f"{label} clipping norm is nonfinite")
-
-        started = time.perf_counter()
-        with torch.autograd.profiler.record_function("training_phase/optimizer"):
-            optimizer.step()
-        torch.cuda.synchronize()
-        phase_times["optimizer_seconds"] = time.perf_counter() - started
-        phase_times["loss"] = float(output.loss.detach())
-        phase_times["clip_norm"] = float(norm)
-        phase_times["memory"] = accelerator_memory()
-        del output
-        return phase_times
-
-    optimizer.zero_grad(set_to_none=True)
     for step in range(1, args.max_steps):
         report.setdefault("extra_steps", []).append(
             complete_update(f"extra_step_{step}")

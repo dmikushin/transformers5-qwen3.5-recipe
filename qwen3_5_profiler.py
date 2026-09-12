@@ -6,7 +6,16 @@ from typing import Any
 
 import torch
 
+from training_profiler import lora_module_category
 from training_profiler import profile_warmed_training_update as _profile
+
+_PACKED_LORA_CLASSES = frozenset({"FastGgufLoraLinear"})
+_GENERIC_LORA_CLASSES = frozenset({"FastLoraLinear"})
+_EXPERT_LORA_CLASSES = frozenset({"FastGgufMoeLora"})
+_LORA_ROLE_FRAGMENTS = (
+    (".shared_expert.", "shared_expert"),
+    (".shared_experts.", "shared_expert"),
+)
 
 
 def _module_category(name: str, module: torch.nn.Module) -> str | None:
@@ -21,17 +30,14 @@ def _module_category(name: str, module: torch.nn.Module) -> str | None:
         return "rmsnorm"
     if class_name == "Qwen3_5MoeSparseMoeBlock":
         return "moe_block"
-    if class_name == "FastGgufMoeLora":
-        return "routed_experts"
-    if class_name == "FastGgufLoraLinear":
-        return "packed_ordinary_lora"
-    if class_name == "FastLoraLinear":
-        if ".shared_expert." in name or ".shared_experts." in name:
-            return "shared_expert"
-        return "ordinary_lora"
-    if name.endswith("lm_head"):
-        return "packed_lm_head"
-    return None
+    return lora_module_category(
+        name,
+        class_name,
+        packed_lora_classes=_PACKED_LORA_CLASSES,
+        generic_lora_classes=_GENERIC_LORA_CLASSES,
+        expert_lora_classes=_EXPERT_LORA_CLASSES,
+        role_fragments=_LORA_ROLE_FRAGMENTS,
+    )
 
 
 def profile_warmed_training_update(

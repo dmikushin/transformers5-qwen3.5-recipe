@@ -75,6 +75,74 @@ def run_phase(
     return result
 
 
+def validate_loss_output(output: Any, label: str) -> None:
+    """Reject a fused training output that materialized logits or auxiliary loss."""
+
+    if getattr(output, "logits", None) is not None:
+        raise RuntimeError(f"{label} materialized full logits")
+    if getattr(output, "aux_loss", None) is not None:
+        raise RuntimeError(f"{label} retained router auxiliary loss")
+    loss = getattr(output, "loss", None)
+    if loss is None or not bool(torch.isfinite(loss).item()):
+        raise RuntimeError(f"{label} produced a missing or nonfinite loss")
+
+
+def complete_training_update(
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    batch: dict[str, torch.Tensor],
+    *,
+    label: str,
+    max_grad_norm: float,
+) -> dict[str, Any]:
+    """Run one synchronized full update and retain phase times plus memory.
+
+    The accelerator peak is reset after the incoming gradients are dropped, so
+    every reported peak belongs to exactly this update and remains comparable
+    across architectures and across extra-step and profiled executions.
+    """
+
+    optimizer.zero_grad(set_to_none=True)
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    phase_times: dict[str, Any] = {}
+
+    started = time.perf_counter()
+    with torch.autograd.profiler.record_function("training_phase/forward"):
+        output = model(**batch, use_cache=False)
+    torch.cuda.synchronize()
+    phase_times["forward_seconds"] = time.perf_counter() - started
+    validate_loss_output(output, label)
+
+    started = time.perf_counter()
+    with torch.autograd.profiler.record_function("training_phase/backward"):
+        output.loss.backward()
+    torch.cuda.synchronize()
+    phase_times["backward_seconds"] = time.perf_counter() - started
+
+    started = time.perf_counter()
+    with torch.autograd.profiler.record_function("training_phase/gradient_clip"):
+        norm = torch.nn.utils.clip_grad_norm_(
+            [parameter for parameter in model.parameters() if parameter.requires_grad],
+            max_grad_norm,
+        )
+    torch.cuda.synchronize()
+    phase_times["clip_seconds"] = time.perf_counter() - started
+    if not bool(torch.isfinite(norm).item()):
+        raise RuntimeError(f"{label} clipping norm is nonfinite")
+
+    started = time.perf_counter()
+    with torch.autograd.profiler.record_function("training_phase/optimizer"):
+        optimizer.step()
+    torch.cuda.synchronize()
+    phase_times["optimizer_seconds"] = time.perf_counter() - started
+    phase_times["loss"] = float(output.loss.detach())
+    phase_times["clip_norm"] = float(norm)
+    phase_times["memory"] = accelerator_memory()
+    del output
+    return phase_times
+
+
 def clean_loading_info(loading_info: dict[str, Any]) -> dict[str, Any]:
     return {
         key: [str(item) for item in value] if isinstance(value, list) else str(value)

@@ -5,7 +5,6 @@ import argparse
 import gc
 import json
 import os
-import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
@@ -46,10 +45,10 @@ from deepseek_v4_profiler import profile_warmed_training_update
 from deepseek_v4_routing import DeepseekV4RouteCollector
 from fast_moe_ranking import configure_fast_moe_ranking
 from training_audit import (
-    accelerator_memory,
     audit_optimizer,
     audit_training_contract,
     clean_loading_info,
+    complete_training_update,
     memory_snapshot,
     representative_packed_state,
     run_phase,
@@ -57,6 +56,7 @@ from training_audit import (
     summarize_gradients,
     summarize_timeline,
     validate_first_gradients,
+    validate_loss_output,
     validate_second_gradients,
 )
 
@@ -364,12 +364,7 @@ def main() -> None:
         "first_forward",
         lambda: model(**batch, use_cache=False),
     )
-    if output.logits is not None or output.aux_loss is not None:
-        raise RuntimeError(
-            "scoped training loss must return logits=None and aux_loss=None"
-        )
-    if output.loss is None or not bool(torch.isfinite(output.loss).item()):
-        raise RuntimeError("first loss is missing or nonfinite")
+    validate_loss_output(output, "first forward")
     first_loss = float(output.loss.detach())
     run_phase(report["timeline"], "first_backward", output.loss.backward)
     first_gradients = summarize_gradients(model, "first_backward")
@@ -418,12 +413,7 @@ def main() -> None:
         "second_forward",
         lambda: model(**batch, use_cache=False),
     )
-    if output.logits is not None or output.aux_loss is not None:
-        raise RuntimeError(
-            "second scoped loss must return logits=None and aux_loss=None"
-        )
-    if output.loss is None or not bool(torch.isfinite(output.loss).item()):
-        raise RuntimeError("second loss is missing or nonfinite")
+    validate_loss_output(output, "second forward")
     second_loss = float(output.loss.detach())
     run_phase(report["timeline"], "second_backward", output.loss.backward)
     second_gradients = summarize_gradients(model, "second_backward")
@@ -459,46 +449,13 @@ def main() -> None:
     collector.remove()
 
     def complete_update(label: str) -> dict[str, Any]:
-        phase_times = {}
-        optimizer.zero_grad(set_to_none=True)
-        started = time.perf_counter()
-        with torch.autograd.profiler.record_function("training_phase/forward"):
-            step_output = model(**batch, use_cache=False)
-        torch.cuda.synchronize()
-        phase_times["forward_seconds"] = time.perf_counter() - started
-        if step_output.logits is not None or not bool(
-            torch.isfinite(step_output.loss).item()
-        ):
-            raise RuntimeError(f"{label} produced invalid scoped loss output")
-        backward_started = time.perf_counter()
-        with torch.autograd.profiler.record_function("training_phase/backward"):
-            step_output.loss.backward()
-        torch.cuda.synchronize()
-        phase_times["backward_seconds"] = time.perf_counter() - backward_started
-        clip_started = time.perf_counter()
-        with torch.autograd.profiler.record_function("training_phase/gradient_clip"):
-            norm = torch.nn.utils.clip_grad_norm_(
-                [
-                    parameter
-                    for parameter in model.parameters()
-                    if parameter.requires_grad
-                ],
-                args.max_grad_norm,
-            )
-        torch.cuda.synchronize()
-        phase_times["clip_seconds"] = time.perf_counter() - clip_started
-        if not bool(torch.isfinite(norm).item()):
-            raise RuntimeError(f"{label} clipping norm is nonfinite")
-        step_started = time.perf_counter()
-        with torch.autograd.profiler.record_function("training_phase/optimizer"):
-            optimizer.step()
-        torch.cuda.synchronize()
-        phase_times["optimizer_seconds"] = time.perf_counter() - step_started
-        phase_times["loss"] = float(step_output.loss.detach())
-        phase_times["clip_norm"] = float(norm)
-        phase_times["memory"] = accelerator_memory()
-        del step_output
-        return phase_times
+        return complete_training_update(
+            model,
+            optimizer,
+            batch,
+            label=label,
+            max_grad_norm=args.max_grad_norm,
+        )
 
     for step in range(1, args.max_steps):
         report.setdefault("extra_steps", []).append(

@@ -9,6 +9,48 @@ from typing import Any
 import torch
 
 ModuleCategorizer = Callable[[str, torch.nn.Module], str | None]
+RoleFragment = tuple[str, str]
+
+
+def lora_module_category(
+    name: str,
+    class_name: str,
+    *,
+    packed_lora_classes: frozenset[str],
+    generic_lora_classes: frozenset[str],
+    expert_lora_classes: frozenset[str],
+    role_fragments: tuple[RoleFragment, ...] = (),
+) -> str | None:
+    """Classify the LoRA wrappers and packed LM head shared by both models.
+
+    Qwen3.5-MoE and DeepSeek V4 profiles use the same category vocabulary and
+    the same precedence so their reports stay comparable:
+
+    * the routed-expert wrapper owns ``routed_experts``;
+    * a shared-expert projection owns ``shared_expert`` regardless of which
+      ordinary wrapper class PEFT selected for it;
+    * the remaining ordinary wrappers split into ``packed_ordinary_lora`` for
+      the native packed-base path and ``ordinary_lora`` for the generic path;
+    * the frozen LM head is ``packed_lm_head``.
+
+    Only the architecture-owned class names and role fragments are supplied by
+    the caller. ``role_fragments`` is applied in order, so an architecture can
+    add a name-owned role such as DeepSeek's ``o_b_proj`` without redefining
+    the shared precedence in its own categorizer.
+    """
+
+    if class_name in expert_lora_classes:
+        return "routed_experts"
+    if class_name in packed_lora_classes or class_name in generic_lora_classes:
+        for fragment, category in role_fragments:
+            if fragment in name:
+                return category
+        if class_name in packed_lora_classes:
+            return "packed_ordinary_lora"
+        return "ordinary_lora"
+    if name.endswith("lm_head"):
+        return "packed_lm_head"
+    return None
 
 
 @contextmanager
