@@ -114,47 +114,51 @@ Grouped `o_a_proj` is a three-dimensional eight-group boundary, not an ordinary 
 - Attention raw FP16 scores are overwritten in place with `dS`. One backward is supported per forward or checkpoint replay. Repeated backward through one retained graph is unsupported.
 - Shared K=V gradients are combined directly without repeated KV heads.
 - Unsupported architecture, batch, sequence, layout, dtype, mask, cache, or grouped-GEMM shape fails closed.
-- `TrainingArguments(use_liger_kernel=False)` remains required. DeepSeek-specific RMSNorm, mHC, and loss integrations are project-local.
+- `train_deepseek_v4.py` uses `BF16AdapterTrainer` with plain `TrainingArguments` (`bf16=True`, `optim=adamw_8bit`, non-reentrant gradient checkpointing). Generic model-wide Liger patching stays disabled. DeepSeek-specific attention, RMSNorm, mHC, routing, and packed-loss integrations are project-local.
 
 ## Latest accepted results
 
 ### Full-model B1 update
 
-The authoritative model-level boundary is physical B1/S2048 with 43 non-reentrant decoder checkpoints.
+The authoritative model-level boundary is physical B1/S2048 with 43 non-reentrant decoder checkpoints, measured on torch `2.14.0+rocm10.1.0a20260904` / HIP `7.16.26354`.
 
 | Update | Forward | Backward | Gradient clip | Optimizer | Total | Throughput |
 |---|---:|---:|---:|---:|---:|---:|
-| Warm untraced | 5.892 s | 12.681 s | 38.8 ms | 110.5 ms | 18.723 s | 109.4 tokens/s |
-| Kineto traced | 5.962 s | 12.744 s | 33.3 ms | 109.7 ms | 18.849 s | 108.7 tokens/s |
+| Warm untraced | 5.028 s | 10.868 s | 38.7 ms | 111.1 ms | 16.046 s | 127.6 tokens/s |
+| Kineto traced | 5.097 s | 10.878 s | 44.9 ms | 109.3 ms | 16.129 s | 127.0 tokens/s |
+
+A repeat traced update reproduced the totals within 0.5%.
 
 The accepted audit confirms:
-- first loss `3.0208380222320557` and post-update second loss `3.009669780731201`.
+- first loss `3.0429608821868896` and post-update second loss `3.043029308319092`.
 - 2 sliding, 21 CSA, and 20 HCA modules use project-owned dispatch.
 - all 469 LoRA-B tensors changed on the first update.
 - all 938 adapter tensors had finite, nonzero gradients on the second backward.
-- all 474 packed parameters retained their payload pointers, versions, storage, and checksums.
+- the audited packed representatives (one per quantization type) retained their payload pointers, versions, storage, and checksums. The load gate re-verifies all 474 packed parameters and 84,512,276,480 payload bytes.
 - all 43 grouped output-A modules remained frozen and gradient-free.
 - all 86 mHC connections, 43 decoder boundaries, and the final head were patched before PEFT.
 - process swap remained zero.
 
 ### Whole-update attribution
 
-The traced update contains 18.565 s of GPU-kernel time. Nested module annotations overlap, so exact kernel-name aggregation is authoritative for percentages.
+The traced update contains 15.944 s of GPU-kernel time (forward 5.058 s, backward 10.789 s, clip and optimizer 0.097 s). Nested module annotations overlap, so exact kernel-name aggregation is authoritative for percentages.
 
 | Kernel family | GPU time | Share |
 |---|---:|---:|
-| Packed frozen MMQ | 11.059 s | 59.6% |
-| PyTorch elementwise kernels | 2.835 s | 15.3% |
-| Sliding, CSA, and HCA attention | 1.533 s | 8.3% |
-| hipBLASLt/rocBLAS GEMM | 0.837 s | 4.5% |
-| Explicit copy and concatenation | 0.512 s | 2.8% |
-| mHC Triton kernels | 0.512 s | 2.8% |
-| AITER routed-LoRA GMM/PTGMM | 0.504 s | 2.7% |
-| RMSNorm kernels | 0.278 s | 1.5% |
+| Packed frozen MMQ | 8.603 s | 54.0% |
+| PyTorch elementwise kernels | 2.626 s | 16.5% |
+| Sliding, CSA, and HCA attention | 1.524 s | 9.6% |
+| hipBLASLt/rocBLAS GEMM | 0.791 s | 5.0% |
+| Explicit copy and concatenation | 0.503 s | 3.2% |
+| mHC Triton kernels | 0.517 s | 3.2% |
+| AITER routed-LoRA GMM/PTGMM | 0.477 s | 3.0% |
+| RMSNorm kernels | 0.271 s | 1.7% |
 
-Packed MMQ subcomponents are 4.029 s input backward, 2.925 s IQ2_XXS gate/up forward and replay, 1.702 s Q2_K down forward and replay, 1.297 s dense forward and replay, 0.868 s grouped output-A forward and replay, and 0.239 s activation quantization.
+Packed MMQ subcomponents are 2.927 s input backward, 2.614 s IQ2_XXS gate/up forward and replay, 1.381 s Q2_K down forward and replay, 1.118 s dense forward and replay, 0.324 s grouped output-A forward and replay, and 0.240 s activation quantization.
 
-The largest generic elementwise kernel is BF16 direct copy/conversion at 1.054 s across 1,936 launches. Vector BF16 add contributes 0.497 s. These launches require ownership attribution before any fusion work.
+The unlisted remainder is 0.620 s, up from 0.482 s: the CSA/HCA backward `dV`/`dK` kernels rose from 0.207 s to 0.318 s (`_local_dv` 48.4 -> 84.2 ms, `_compressed_dv_partial` 37.4 -> 64.2 ms) under the current torch/ROCm toolchain on the unchanged BHSD layout.
+
+The largest generic elementwise kernel is BF16 direct copy/conversion at 0.895 s across 1,896 launches. Vector BF16 add contributes 0.491 s. These launches require ownership attribution before any fusion work.
 
 ### Memory
 
@@ -162,12 +166,12 @@ The ROCm-visible device capacity is 125 GiB.
 
 | Boundary | Allocated | Reserved or free |
 |---|---:|---:|
-| Packed model loaded | 80.834 GiB | 39.816 GiB free |
-| Adapters injected | 81.973 GiB | 82.100 GiB reserved |
-| Complete-update peak | 87.615 GiB | 87.955 GiB reserved |
-| After traced update | 84.559 GiB | 32.229 GiB free |
+| Packed model loaded | 80.763 GiB | 37.879 GiB free |
+| Adapters injected | 81.966 GiB | 82.850 GiB reserved |
+| Complete-update peak | 87.517 GiB | 89.125 GiB reserved |
+| After traced update | 84.551 GiB | 31.124 GiB free |
 
-The high-water mark occurs during backward. Peak allocation is 6.781 GiB above the loaded model and 5.641 GiB above the adapter-injected state. Final profiler-process RSS is 4.288 GiB and process swap is zero.
+The high-water mark occurs during backward. Peak allocation is 6.754 GiB above the loaded model and 5.551 GiB above the adapter-injected state. Allocator replay at the peak shows 4.168 GiB of net transient allocation across 123 live blocks: 42 retained 64 MiB mHC merge stream tensors (2.63 GiB), AITER GMM outputs (4 x 192 MiB), split-gate outputs (3 x 144 MiB), and CSA/RoPE state (4 x 128 MiB), plus routing and grouped-MMQ workspaces. Reserved memory is 1.17 GiB higher than the earlier profile at identical live bytes, a caching-allocator difference in the current torch. Final process RSS is 4.134 GiB and process swap is zero.
 
 ### Attention components
 
@@ -270,7 +274,7 @@ Rejected or deferred:
 
 ### Packed LM-head loss
 
-`apply_deepseek_v4_liger_loss()` processes 512 hidden rows at a time, applies packed Q8_0 MMQ, computes fused cross-entropy, and returns the packed hidden-state input gradient. It does not materialize full logits or the approximately 0.99 GiB logical BF16 LM head. Materialized helpers are bounded correctness oracles only.
+`deepseek_v4_liger_loss.py` owns the DeepSeek entry points and validated constants (Q8_0 head, 512-row chunks). The shared `packed_liger_loss` module owns the chunked Q8_1 MMQ, in-place Liger cross-entropy, and packed logical input Jacobian. The patch processes 512 hidden rows at a time and returns the packed hidden-state input gradient. It does not materialize full logits or the approximately 0.99 GiB logical BF16 LM head. Materialized helpers are bounded correctness oracles only.
 
 Rejected or deferred:
 - Full-logit loss was rejected because it materializes about 0.49 GiB at B1, 1.97 GiB at B4, and 7.9 GiB at B16 before loss backward.
@@ -305,6 +309,7 @@ Rejected or deferred:
 - HCA local/compressed `dQ` splitting measured 327.8 ms complete versus 314.1-314.7 ms for the then-combined owner. It duplicated control work while compressed pairs represented only 5.7% of visible pairs, so the split was removed.
 - Static C128 HCA producer expansion was rejected because compile time and instruction size exceeded the bounded production contract. Dynamic producer loops remain retained.
 - Reopen an attention family only when a larger fusion beats its complete producer-plus-attention boundary and preserves its exact gradients, state ownership, and checkpoint replay.
+- A BSHD-layout retune of CSA/HCA is parked on the `csa-hca-bshd` branch. The accepted contract remains BHSD Q/KV with contiguous BSHD output.
 
 ### Routing
 
@@ -357,9 +362,9 @@ Rejected or deferred:
 
 - Base-model attention, routing, MMQ, RMSNorm, and mHC patches are installed before PEFT.
 - Packed LM-head loss is mandatory.
-- Training keeps `use_liger_kernel=False` because generic Liger has no DeepSeek V4 registry contract.
+- Generic model-wide Liger patching stays disabled because it has no DeepSeek V4 registry contract. `train_deepseek_v4.py` drives the model through `BF16AdapterTrainer` with non-reentrant checkpointing.
 - Production contains one retained path per accepted boundary. Experimental selectors and losing branches are absent.
-- The repository suite passes `106/106`. Ruff, `py_compile`, and `git diff --check` pass.
+- The repository suite passes `146/146`. Ruff, `ty`, and `git diff --check` pass.
 
 Rejected or deferred:
 - Runtime experimental switches were removed after selection so checkpoint replay and user-facing training cannot diverge from the accepted path.
@@ -433,7 +438,7 @@ Grouped `o_a_proj` must remain explicitly unsupported rather than silently omitt
 Consider additional fusion only after B4/B16 establishes the next limiting boundary.
 
 Current candidates are:
-- BF16 direct copy/conversion and vector-add traffic attributed to its owning packed-input-gradient, residual, LoRA, mHC, or producer boundary.
+- BF16 direct copy/conversion (0.895 s across 1,896 launches) and vector-add traffic (0.491 s) attributed to its owning packed-input-gradient, residual, LoRA, mHC, or producer boundary.
 - packed-MMQ fusion that removes adjacent quantization, activation, routing, residual, or LoRA traffic.
 - workspace-lifetime fusion required by a measured B16 peak.
 
@@ -463,8 +468,11 @@ Do not accept isolated throughput that regresses complete-update time, memory, c
 
 Training and full-model audit:
 - `train_deepseek_v4.py`.
+- `bf16_adapter_trainer.py`.
 - `audit_deepseek_v4_training_step.py`.
 - `deepseek_v4_profiler.py`.
+- `training_audit.py`.
+- `training_profiler.py`.
 
 Attention:
 - `deepseek_v4_attention.py`.
@@ -483,6 +491,7 @@ Adapters and grouped GEMM:
 
 Packed loss, routing, norm, and mHC:
 - `deepseek_v4_liger_loss.py`.
+- `packed_liger_loss.py`.
 - `deepseek_v4_liger_rmsnorm.py`.
 - `deepseek_v4_liger_mhc.py`.
 - `deepseek_v4_routing.py`.

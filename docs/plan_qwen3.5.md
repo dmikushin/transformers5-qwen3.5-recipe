@@ -15,6 +15,7 @@ Configuration:
 - non-reentrant gradient checkpointing on all 40 decoder layers.
 - bitsandbytes `adamw_8bit` for adapter parameters only.
 - top-8 routing active, with router-logit retention and the auxiliary balancing objective disabled.
+- Liger RMSNorm on all 101 Qwen3.5-MoE norms and FLA's fused gated RMSNorm on the 30 GatedDeltaNet norms.
 
 Future optimization must preserve these rules:
 - GGUF is the sole base-weight representation.
@@ -28,6 +29,7 @@ Future optimization must preserve these rules:
 - Gradient checkpointing remains non-reentrant and is verified on all 40 layers after trainer construction.
 - Batch size remains 1 and sequence length remains 2048 for the validated memory claim.
 - Router-logit retention and the router auxiliary loss remain disabled. Top-8 dispatch remains active.
+- Fused norm patches remain instance-local, keep module classes, parameter names, shapes, and dtypes unchanged, and fail closed unless all 101 plain and 30 gated norms are handled.
 - The real project dataset is not scanned, aggregated, regenerated, or rewritten without explicit approval.
 - Native operators remain gfx1151-specific, asynchronous on the current Torch stream, and fail rather than inserting hidden operand copies.
 
@@ -39,17 +41,17 @@ The checkpoint remains compressed after loading:
 - 733 checkpoint tensors.
 - 34,660,610,688 logical parameters.
 - 14,216,723,456 packed payload bytes.
-- 351 `GGUFLinear` modules.
-- 40 `GGUFExperts` modules.
-- 432 frozen `GGUFQuantizedTensor` parameters.
-- approximately 13.282 GiB live allocation immediately after load.
+- 351 `GgufLinear` modules.
+- 40 `GgufExperts` modules.
+- 432 frozen `GgufQuantizedParameter` parameters.
+- approximately 13.283 GiB live allocation immediately after load.
 
 Reusable Transformers support provides:
-- `GGUFLinear.materialize_logical_weight()` as a compatibility boundary for consumers that genuinely need a canonical floating matrix.
+- `GgufLinear.materialize_logical_weight()` as a compatibility boundary for consumers that genuinely need a canonical floating matrix.
 - Qwen3.5 recurrent input/output layout handling.
-- capability-validated private expert backend names for specialized `GGUFExperts` execution.
+- capability-validated private expert backend names for specialized `GgufExperts` execution: the architecture-wide registry rejects them, but the model-level check accepts a private name once every applicable expert module's own `_validate_supported_experts_implementation` validator accepts it.
 
-The ordinary, routed-expert, and LM-head paths no longer materialize logical base matrices. The remaining users of logical materialization are the 90 recurrent-layout projections that do not yet have permutation-aware MMQ kernels and explicit compatibility/reference paths.
+The ordinary, routed-expert, and LM-head paths no longer materialize logical base matrices. The remaining users of logical materialization are the 90 GatedDeltaNet projections on the generic compiled-dequant path. Their row reorder is now folded into the packed payload (`PermuteRows`/`TiledToGroupedRows` are packed-safe), so they look permutation-free at runtime. They stay generic because `torch-ggml-ops` has no exact dense deployment for `linear_attn.in_proj_z` (`N=4096`, `K=2048`, Q3_K/Q4_K) or for one Q5_K `linear_attn.in_proj_qkv`, and `linear_attn.out_proj` still consumes a runtime input permutation whose columns cross quantization blocks.
 
 ### Ordinary packed LoRA
 
@@ -58,8 +60,10 @@ The ordinary, routed-expert, and LM-head paths no longer materialize logical bas
 Current model composition:
 - 250 ordinary LoRA wrappers.
 - 160 ordinary packed projections using native MMQ in forward and backward.
-- 90 GatedDeltaNet/recurrent-layout projections using the generic GGUF compatibility path.
+- 90 GatedDeltaNet projections (`linear_attn.in_proj_qkv`, `linear_attn.in_proj_z`, `linear_attn.out_proj`) using the generic compiled-dequant base forward.
 - 250 ordinary LoRA-A and LoRA-B factor pairs included in normal PEFT serialization.
+
+`FastGgufLoraLinear.uses_packed_mmq()` is the single source of truth for the path decision. The GatedDeltaNet projections are selected by module name because geometry alone cannot separate `linear_attn.in_proj_qkv` from `q_proj`, and those layouts are outside the dense MMQ deployment contract in `torch-ggml-ops`.
 
 For the 160 native projections:
 - the frozen BF16 input is dynamically quantized to Q8_1.
@@ -73,7 +77,7 @@ The native backward removes logical-weight allocation at the cost of lower isola
 
 ### Routed-expert packed LoRA
 
-`fast_moe_lora.py` wraps each complete `GGUFExperts` module and preserves four rank-4 BF16 factor families per adapter:
+`fast_moe_lora.py` wraps each complete `GgufExperts` module and preserves four rank-4 BF16 factor families per adapter:
 - combined gate/up A.
 - combined gate/up B.
 - down A.
@@ -118,7 +122,7 @@ The latest isolated warmed launch sweep on gfx1151 measured:
 | 4 | 8,192 | 1.325 ms | 3.363 ms |
 | 16 | 32,768 | 5.252 ms | 14.691 ms |
 
-The latest full-step profile remains the batch-1 profile below: it measured 14.657 ms for all 40 gather-backward launches and 33.313 ms for all 40 combine-backward launches. Residual `aten::_index_put_impl_` activity was 0.273 ms across 80 metadata operations. Automated tests cover BF16 and FP32 routing weights, exact forward and gradient behavior at fixed and dynamic token counts, batch-1/4/16 dispatch policy, fallback dispatch, and absence of generic indexed-scatter backward. Separate large-grid validation executed exact constant-value forward and gradient checks at batches 4 and 16.
+The current full-step profile measured 15.244 ms for all 40 gather-backward launches, 26.817 ms for all 40 combine-backward launches, 22.833 ms of gather forward, and 32.475 ms of combine forward. Generic indexed-scatter backward (`aten::_index_put_impl_`) is now absent from the step. Automated tests cover BF16 and FP32 routing weights, exact forward and gradient behavior at fixed and dynamic token counts, batch-1/4/16 dispatch policy, fallback dispatch, and absence of generic indexed-scatter backward. Separate large-grid validation executed exact constant-value forward and gradient checks at batches 4 and 16.
 
 ### Native gfx1151 GGUF operators
 
@@ -149,7 +153,7 @@ Important implementation properties:
 - FakeTensor/meta registration, registered autograd, `torch.library.opcheck`, and `torch.compile` composition.
 - explicit higher-order-gradient rejection.
 
-The dense Q6_K backward decoder broadcasts one `d * scale` value across each 16-column WMMA tile. Wider-N and eight-wave schedules were measured and removed because they regressed the real LM-head geometry. The final package has 38 passing tests.
+The dense Q6_K backward decoder broadcasts one `d * scale` value across each 16-column WMMA tile. Wider-N and eight-wave schedules were measured and removed because they regressed the real LM-head geometry. The package test suite covers exact deployment membership, validation boundaries, registered autograd, and the grouped and paired paths. Its `test_grouped_mmq.py` and `test_public_deployment_correctness.py` modules still import the pre-refactor `transformers.integrations.gguf_dequant` path and no longer collect against the current Transformers.
 
 ### Packed LM-head loss
 
@@ -157,7 +161,7 @@ The Q6_K language-model head has logical shape `[248320, 2048]`:
 - packed payload: 417,177,600 bytes, approximately 0.389 GiB.
 - logical BF16 matrix avoided: approximately 0.947 GiB.
 
-`gguf_liger_loss.py` now owns a project-local packed causal-language-model loss:
+`packed_liger_loss.py` owns the shared chunked packed causal-language-model loss. `gguf_liger_loss.py` owns the Qwen3.5-MoE entry points and its validated constants (hidden size 2048, Q6_K head, 256-row chunks):
 - flatten and causally shift labels.
 - process 256 hidden rows per chunk.
 - explicitly clone the at-most 1 MiB BF16 slice because native MMQ requires zero storage offset.
@@ -198,30 +202,37 @@ A 2,048-row packed-loss benchmark measured:
 
 The 256-row schedule is 26.5% faster in the complete MMQ-forward, in-place cross-entropy, and MMQ-backward loop. Its additional approximately 184.5 MiB peak allocation is accepted.
 
+### Fused RMSNorm
+
+`qwen3_5_fused_norms.py` installs both Qwen3.5-MoE norms on the module instances before PEFT wrapping, using the same shared patch protocol as the DeepSeek kernels:
+- 101 `Qwen3_5MoeRMSNorm` instances (40 input, 40 post-attention, 10 query, 10 key, 1 final) use Liger's `LigerRMSNormFunction` with `offset=1.0`, `casting_mode="gemma"`, and `in_place=False`, preserving `x_norm * (1 + weight)` in FP32 with the input dtype restored.
+- 30 `Qwen3_5MoeRMSNormGated` instances use FLA's `LayerNormGatedFunction` (`is_rms_norm=True`, SiLU gate), preserving `weight * x_norm * silu(gate)` for the GatedDeltaNet output norm.
+
+The patched module classes, parameter names, shapes, and dtypes are unchanged, so PEFT serialization, the frozen-base contract, and the audit inventories stay valid. `require_complete_qwen35_fused_norms` fails closed unless exactly 101 plain and 30 gated norms are handled, and the audit records the complete patch inventory.
+
+Complete fused norm kernel time is 42.6 ms per traced step: 12.2 ms gated forward, 14.5 ms gated backward, 4.6 ms Liger row-norm forward, 7.1 ms Liger row-norm backward, and 4.3 ms of block-norm variants. This replaces the eager FP32 norm graphs, which accounted for the forward `reduction` (20.3 ms), `copy_init` (69.9 ms), and part of the `elementwise` (129.8 ms) families, plus the backward `copy_init` (145.4 ms), `elementwise` (296.7 ms), and `reduction` (31.4 ms) families in the earlier profile.
+
 ### Router auxiliary-memory removal
 
 Top-8 routing is unchanged, but retention of all layer router logits and the generic load-balancing objective are disabled:
 - `model.config.output_router_logits = False`.
 - `model.config.router_aux_loss_coef = 0.0`.
-- `SFTConfig(router_aux_loss_coef=0.0)`.
 
-All three settings are required because current TRL copies its coefficient back into the model configuration. Runtime checks reject a trainer that re-enables router-logit collection or a nonzero auxiliary coefficient.
+The driver sets the same coefficient before wrapping, and the audit rejects a model that re-enables router-logit collection or a nonzero auxiliary coefficient.
 
 This removes the large dense one-hot/expanded router auxiliary tensors while preserving actual expert dispatch.
 
 ### Trainer, data, attention, and recurrent execution
 
-The trainer also includes:
-- `get_peft_model(..., autocast_adapter_dtype=False)` so adapters remain BF16.
-- explicit non-reentrant checkpoint enablement after `SFTTrainer` construction.
-- verification that all 40 layers are checkpointed.
-- `packing=False` and `padding_free=False`.
+The `train_qwen3_5_35b.py` driver and its `BF16AdapterTrainer` include:
+- `get_peft_model(..., autocast_adapter_dtype=False)` so adapters remain BF16, and adapter restore keeps that dtype on checkpoint resume.
+- `gradient_checkpointing=True` with `gradient_checkpointing_kwargs={"use_reentrant": False}`. The audit then verifies that all 40 layers are checkpointed and non-reentrant.
 - compact fixed-length dataset rows containing `input_ids` and `num_tokens`.
-- collator reconstruction of attention masks and `-100` labels.
+- a collator that reconstructs attention masks and `-100` labels.
 - deterministic guarded Flash Attention 2 choices for the validated geometry.
-- 14 exact FLA autotuner preloads across 13 autotuners.
-- a project-local compiled GGUF dequantization fallback for operations that do not yet have layout-correct native MMQ, chiefly the 90 recurrent projections.
-- Liger RMSNorm only where independently useful.
+- 17 exact FLA autotuner preloads across 13 kernels.
+- a project-local compiled GGUF dequantization fallback for operations that do not yet have layout-correct native MMQ, chiefly the 90 GatedDeltaNet projections.
+- Liger and FLA fused norms on all 131 Qwen3.5-MoE norms (see Fused RMSNorm above).
 
 ### Warmed full-step runtime profile
 
@@ -233,82 +244,103 @@ The latest profile uses:
 - synchronized wall-clock boundaries around forward, backward, gradient clipping, and the optimizer.
 - correlated GPU kernel-duration sums for module and kernel attribution.
 
-The warm-up update took 9.998 seconds. The warmed traced update measured:
+The warmed traced update measured:
 
 | Phase | Wall time | Step share |
 | --- | ---: | ---: |
-| Forward | 2.019 s | 31.04% |
-| Backward | 4.406 s | 67.71% |
-| Gradient clipping | 10.6 ms | 0.16% |
-| AdamW8bit step | 46.7 ms | 0.72% |
-| Other loop overhead | 24.0 ms | 0.37% |
-| Total | 6.507 s | 100% |
+| Forward | 1.433 s | 26.89% |
+| Backward | 3.830 s | 71.86% |
+| Gradient clipping | 15.4 ms | 0.29% |
+| AdamW8bit step | 51.4 ms | 0.96% |
+| Other loop overhead | 0.2 ms | 0.00% |
+| Total | 5.330 s | 100% |
+
+The audit process measured the same update independently at 1.433 s forward and 3.830 s backward. The instrumented deep trace measured 1.434 s and 3.822 s.
 
 The traced times include profiler overhead and are a single warmed sample rather than a benchmark distribution. They are suitable for relative attribution because all requested kernel families were correlated to their launching operations.
 
-Forward decoder-layer GPU work totaled 1.448 seconds:
+Forward decoder-layer GPU work totaled 1.203 seconds:
 
 | Module | GPU kernel time | Calls | Average per call |
 | --- | ---: | ---: | ---: |
-| MoE block | 694.2 ms | 40 | 17.35 ms |
-| GatedDeltaNet | 638.4 ms | 30 | 21.28 ms |
-| Routed experts | 626.1 ms | 40 | 15.65 ms |
-| Full attention | 109.8 ms | 10 | 10.98 ms |
-| Shared-expert MLP | 40.2 ms | 40 | 1.01 ms |
+| MoE block | 521.2 ms | 40 | 13.03 ms |
+| GatedDeltaNet | 579.3 ms | 30 | 19.31 ms |
+| Routed experts | 462.0 ms | 40 | 11.55 ms |
+| Full attention | 97.1 ms | 10 | 9.71 ms |
+| Shared-expert MLP | 33.2 ms | 40 | 0.83 ms |
 
-GatedDeltaNet forward contains 296.0 ms of FLA/recurrent kernels and 253.4 ms of GEMM. The complete Flash Attention forward kernels take 16.9 ms. Approximately 235 ms outside the decoder layers is the packed LM-head MMQ, packed input gradient, and in-place cross-entropy path.
+GatedDeltaNet forward contains 289.0 ms of FLA/recurrent kernels and 246.6 ms of GEMM. The complete Flash Attention forward kernels take 23.4 ms. Approximately 205 ms outside the decoder layers is the packed LM-head MMQ, packed input gradient, and in-place cross-entropy path. The 42.6 ms of fused norm kernels are attributed to their owning modules.
 
-Backward decoder-layer GPU work totaled 4.311 seconds. Non-reentrant checkpoint recomputation accounts for 1.441 seconds, or 33.4%, while actual autograd work accounts for 2.870 seconds. The exclusive decomposition is:
+Backward decoder-layer GPU work totaled 3.762 seconds. Non-reentrant checkpoint recomputation accounts for 1.195 seconds, or 31.8%, while actual autograd work accounts for 2.567 seconds. The exclusive decomposition is:
 
 | Module side | Actual backward | Checkpoint recompute | Inclusive backward phase |
 | --- | ---: | ---: | ---: |
-| MoE | 742.6 ms | 688.0 ms | 1.431 s |
-| GatedDeltaNet side | 1.670 s | 641.8 ms | 2.311 s |
-| Attention side | 458.2 ms | 111.2 ms | 569.4 ms |
+| MoE | 622.2 ms | 513.4 ms | 1.136 s |
+| GatedDeltaNet side | 1.550 s | 582.9 ms | 2.132 s |
+| Attention side | 395.5 ms | 98.7 ms | 494.2 ms |
 
 The kernel-family totals are:
 
 | Kernel family | Forward GPU time | Backward-phase GPU time |
 | --- | ---: | ---: |
-| FLA/recurrent | 296.0 ms | 1.348 s |
-| Grouped MMQ | 364.9 ms | 771.4 ms |
-| GEMM | 298.3 ms | 609.8 ms |
-| Dense MMQ | 296.1 ms | 157.5 ms |
-| Flash Attention | 16.9 ms | 333.6 ms |
-| AITER GMM | 93.9 ms | 168.5 ms |
-| AITER PTGMM | 0 ms | 48.1 ms |
-| Routing/indexing | 60.0 ms | 118.9 ms |
+| FLA/recurrent | 289.0 ms | 1.304 s |
+| Grouped MMQ | 285.0 ms | 588.8 ms |
+| GEMM | 293.6 ms | 606.1 ms |
+| Dense MMQ | 255.1 ms | 123.5 ms |
+| Flash Attention | 23.4 ms | 332.1 ms |
+| AITER GMM | 63.1 ms | 129.7 ms |
+| AITER PTGMM | 0 ms | 45.9 ms |
+| Routing/indexing | 18.4 ms | 61.9 ms |
 
-Backward-phase totals include checkpoint recomputation. The remaining leading opportunities are GatedDeltaNet/FLA, grouped-MMQ input gradients, GEMM, and Flash Attention.
+Backward-phase totals include checkpoint recomputation. The remaining leading opportunities are GatedDeltaNet/FLA backward, the generic-dequant GatedDeltaNet projections, grouped-MMQ input gradients, GEMM, and Flash Attention.
 
 Profile artifacts:
-- refined report: `~/tmp/test_no_unsloth/qwen35_training_step_profile_refined_routing.json`.
-- Chrome/Kineto trace: `~/tmp/test_no_unsloth/qwen35_training_step_trace_routing.json`.
-- reproduction driver: `~/tmp/test_no_unsloth/profile_qwen35_training_step.py`.
+- refined report: `~/tmp/test_no_unsloth/qwen35_deep_refined.json`.
+- audit gate report: `~/tmp/test_no_unsloth/qwen35_audit_report.json`.
+- Kineto traces: `~/tmp/test_no_unsloth/qwen35_profile.trace.json` (audit) and `~/tmp/test_no_unsloth/qwen35_deep.trace.json` (module and direction annotations).
+- reproduction drivers: `audit_qwen3_5_training_step.py` (gates and canonical profile) and `~/tmp/test_no_unsloth/profile_qwen35_step_deep.py` (deep module and direction attribution).
+- peak-memory replay: `~/tmp/test_no_unsloth/peak_memory_profile.py` and `~/tmp/test_no_unsloth/qwen35_peak_memory.json`.
+
+### Memory
+
+The ROCm-visible device capacity is 125 GiB.
+
+| Boundary | Allocated | Reserved or free |
+| --- | ---: | ---: |
+| Packed model loaded | 13.283 GiB | 107.290 GiB free |
+| Adapters injected | 13.742 GiB | 13.777 GiB reserved |
+| Complete-update peak | 15.228 GiB | 15.354 GiB reserved |
+| After traced update | 14.759 GiB | 104.790 GiB free |
+
+The high-water mark occurs during the backward pass. Peak allocation is 1.945 GiB above the loaded model and 1.486 GiB above the adapter-injected state, and the post-update state sits 0.469 GiB below the peak.
+
+Replaying the allocator event stream at the peak shows the live set is the resident 13.283 GiB packed base, 0.441 GiB BF16 adapters, 0.438 GiB BF16 adapter gradients, 0.458 GiB AdamW8bit state, and roughly 0.6 GiB of transient activations and workspaces. The largest transient blocks are AITER GMM outputs (96 MiB), a grouped-MMQ output (64 MiB), `_fused_lora_add` addmm outputs (60 MiB), FLA `l2norm` state (32 MiB), and per-layer Liger/FLA norm buffers (16 MiB each). Final profiler-process RSS is 3.97 GiB and process swap is zero.
+
+Both the live allocation and the allocator reservation stay below the 16 GiB claim, with about 0.77 GiB and 0.65 GiB of headroom respectively.
 
 ## Remaining work
 
-- Add permutation-aware MMQ for the 90 GatedDeltaNet projections.
-  - preserve physical input/output permutations exactly.
-  - keep authoritative GGUF values and the original BF16 LoRA input.
-  - remove their remaining logical-weight compatibility materializations.
-  - target the measured 253.4 ms GatedDeltaNet forward GEMM and 274.2 ms actual-backward GEMM, plus their checkpoint repetition.
+- Add exact dense MMQ deployments for the remaining GatedDeltaNet projections.
+  - 60 of the 90 (`linear_attn.in_proj_qkv`, `linear_attn.in_proj_z`) now carry their reorder in the packed payload and are otherwise native-MMQ-shaped. They stay on the generic compiled-dequant forward because the deployment table has no exact key for `linear_attn.in_proj_z` (`N=4096`, `K=2048`, Q3_K/Q4_K) or for one Q5_K `linear_attn.in_proj_qkv` at any trained `M`.
+  - `linear_attn.out_proj` still consumes a runtime input permutation whose columns cross quantization blocks, so it needs a permutation-aware deployment rather than a plain dense one.
+  - the generic fallback currently costs 217 ms forward and 471 ms backward per step across 1,593 correlated launches, dominated by the frozen-base input-gradient GEMM.
+  - keep authoritative packed values and the original BF16 LoRA input. Do not materialize logical matrices for a whole layer.
   - measure full-model runtime and memory rather than relying only on isolated projections.
 
 - Reduce GatedDeltaNet/FLA backward time.
-  - actual GatedDeltaNet-side backward is 1.670 seconds, including 1.053 seconds of FLA/recurrent kernels.
-  - prioritize the `chunk_gated_delta_rule_bwd_kernel_dhu`, `chunk_bwd_kernel_dqkwg`, WY-preparation, and causal-convolution backward paths.
+  - actual GatedDeltaNet-side backward is 1.550 seconds, including 1.014 seconds of FLA/recurrent kernels and 279 ms of GEMM.
+  - prioritize `chunk_gated_delta_rule_bwd_kernel_dhu` (444.5 ms across 30 launches), `chunk_bwd_kernel_dqkwg` (255.6 ms), WY preparation (163.6 ms backward and 88.0 ms forward replay), and the causal-convolution backward (128.8 ms).
   - retain the fixed and exact recurrence rather than replacing the layer with a different algorithm.
-  - account for the additional 641.8 ms GatedDeltaNet-side checkpoint recomputation when evaluating forward changes.
+  - account for the additional 583 ms GatedDeltaNet-side checkpoint recomputation when evaluating forward changes.
 
 - Reduce grouped packed input-gradient runtime.
-  - paired gate/up and down packed input gradients cost 223.1 ms and 183.9 ms per step respectively.
+  - paired gate/up and down packed input gradients cost 184.5 ms and 119.8 ms per step respectively.
   - preserve the current 8/16/64 MiB-scale live footprints.
   - tune decoder reuse, occupancy, and WMMA scheduling.
   - reject optimizations that require logical matrices, packed transposes, or cotangent quantization.
 
 - Tune rank-4 AITER LoRA execution after the larger bottlenecks.
-  - route-count profiling is complete: actual input-gradient GMM costs 74.5 ms, PTGMM costs 48.1 ms, and checkpoint recomputation adds 93.9 ms of forward GMM.
+  - AITER GMM costs 63.1 ms forward and 129.7 ms backward, and PTGMM costs 45.9 ms backward. Checkpoint recomputation adds its own forward GMM work.
   - reduce factor-layout repacking and contiguous intermediates where AITER supports the required layout.
   - investigate LoRA-B accumulation only if AITER exposes safe GEMM alpha/beta or epilogue support.
   - keep this below GatedDeltaNet/FLA and grouped-MMQ backward in priority.
