@@ -13,6 +13,7 @@ from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
 )
 
 from deepseek_v4_liger_mhc import (
+    _MHC_MARKER,
     configure_deepseek_v4_liger_mhc,
     deepseek_v4_mhc_fn_cache,
     deepseek_v4_mhc_head,
@@ -20,18 +21,13 @@ from deepseek_v4_liger_mhc import (
     deepseek_v4_mhc_prepare,
     require_complete_deepseek_v4_liger_mhc,
 )
+from test_support import assert_close_mixed_precision, require_grad
 
 _HC = 4
 _HIDDEN = 4096
 _FLAT = _HC * _HIDDEN
 _MIX = 24
 _EPS = 1e-6
-
-
-def _require_grad(tensor: torch.Tensor) -> torch.Tensor:
-    if tensor.grad is None:
-        raise AssertionError("expected a tensor gradient")
-    return tensor.grad
 
 
 def _controls(seed: int = 2026):
@@ -109,30 +105,6 @@ def _reference(
     ).view_as(x)
 
 
-def _metrics(candidate: torch.Tensor, reference: torch.Tensor):
-    candidate = candidate.detach().float().flatten()
-    reference = reference.detach().float().flatten()
-    delta = candidate - reference
-    return (
-        float(F.cosine_similarity(candidate, reference, dim=0)),
-        float(
-            delta.square().mean().sqrt() / (reference.square().mean().sqrt() + 1e-12)
-        ),
-    )
-
-
-def _assert_mixed_close(
-    candidate: torch.Tensor,
-    reference: torch.Tensor,
-    *,
-    minimum_cosine: float,
-    maximum_relative_rmse: float,
-):
-    cosine, relative_rmse = _metrics(candidate, reference)
-    assert cosine >= minimum_cosine
-    assert relative_rmse <= maximum_relative_rmse
-
-
 def test_fused_mhc_matches_transformers_forward_and_activation_gradients() -> None:
     torch.manual_seed(17)
     rows = 2048
@@ -163,32 +135,32 @@ def test_fused_mhc_matches_transformers_forward_and_activation_gradients() -> No
         (grad_collapsed, candidate_merged_cotangent),
     )
 
-    _assert_mixed_close(
+    assert_close_mixed_precision(
         candidate_collapsed,
         reference_collapsed,
         minimum_cosine=0.999999,
         maximum_relative_rmse=1e-4,
     )
-    _assert_mixed_close(
+    assert_close_mixed_precision(
         candidate_merged,
         reference_merged,
         minimum_cosine=0.999999,
         maximum_relative_rmse=1e-4,
     )
-    _assert_mixed_close(
-        _require_grad(candidate_x),
-        _require_grad(reference_x),
+    assert_close_mixed_precision(
+        require_grad(candidate_x),
+        require_grad(reference_x),
         minimum_cosine=0.9999,
         maximum_relative_rmse=0.01,
     )
-    _assert_mixed_close(
-        _require_grad(candidate_branch),
-        _require_grad(reference_branch),
+    assert_close_mixed_precision(
+        require_grad(candidate_branch),
+        require_grad(reference_branch),
         minimum_cosine=0.999999,
         maximum_relative_rmse=1e-4,
     )
     assert (
-        _require_grad(candidate_x).untyped_storage().data_ptr()
+        require_grad(candidate_x).untyped_storage().data_ptr()
         == candidate_merged_cotangent.untyped_storage().data_ptr()
     )
     assert fn.grad is None
@@ -224,9 +196,9 @@ def test_prepare_handles_undefined_residual_and_coefficient_cotangents() -> None
     )
     torch.autograd.backward(reference_collapsed, grad_collapsed)
 
-    _assert_mixed_close(
-        _require_grad(candidate_x),
-        _require_grad(reference_x),
+    assert_close_mixed_precision(
+        require_grad(candidate_x),
+        require_grad(reference_x),
         minimum_cosine=0.9999,
         maximum_relative_rmse=0.01,
     )
@@ -248,8 +220,8 @@ def test_fused_mhc_runs_exact_batch_1_4_16_geometries() -> None:
         )
         assert collapsed.shape == (rows, _HIDDEN)
         assert merged.shape == (rows, _HC, _HIDDEN)
-        assert torch.isfinite(_require_grad(x)).all()
-        assert torch.isfinite(_require_grad(branch)).all()
+        assert torch.isfinite(require_grad(x)).all()
+        assert torch.isfinite(require_grad(branch)).all()
         del x, branch, collapsed, merged
 
 
@@ -330,15 +302,15 @@ def test_mhc_head_matches_transformers_forward_and_activation_gradient() -> None
     candidate_output = deepseek_v4_mhc_head(candidate_x, fn, base, scale)
     candidate_output.backward(grad_output)
 
-    _assert_mixed_close(
+    assert_close_mixed_precision(
         candidate_output,
         reference_output,
         minimum_cosine=0.999999,
         maximum_relative_rmse=1e-4,
     )
-    _assert_mixed_close(
-        _require_grad(candidate_x),
-        _require_grad(reference_x),
+    assert_close_mixed_precision(
+        require_grad(candidate_x),
+        require_grad(reference_x),
         minimum_cosine=0.9999,
         maximum_relative_rmse=0.01,
     )
@@ -356,7 +328,7 @@ def test_mhc_head_runs_exact_batch_1_4_16_geometries() -> None:
         output = deepseek_v4_mhc_head(x, fn, base, scale)
         output.backward(torch.ones_like(output))
         assert output.shape == (rows, _HIDDEN)
-        assert torch.isfinite(_require_grad(x)).all()
+        assert torch.isfinite(require_grad(x)).all()
         del x, output
 
 
@@ -449,6 +421,6 @@ def test_model_configurator_is_idempotent_and_survives_peft() -> None:
         autocast_adapter_dtype=False,
     )
     patched = wrapped.base_model.model
-    assert patched.layer._deepseek_v4_liger_mhc
-    assert patched.layer.attn_hc._deepseek_v4_liger_mhc
-    assert patched.hc_head._deepseek_v4_liger_mhc
+    assert getattr(patched.layer, _MHC_MARKER)
+    assert getattr(patched.layer.attn_hc, _MHC_MARKER)
+    assert getattr(patched.hc_head, _MHC_MARKER)

@@ -15,6 +15,7 @@ from transformers.integrations.gguf.modules import GgufLinear
 
 from fast_lora import FastGgufLoraLinear, register_fast_lora
 from gguf_support import dequantize_gguf_tensor
+from test_support import require_grad
 
 _MODEL = Path(
     os.environ.get(
@@ -22,12 +23,6 @@ _MODEL = Path(
         os.path.expanduser("~/models/qwen3.6/Qwen3.6-35B-A3B-APEX-I-Mini.gguf"),
     )
 )
-
-
-def _require_grad(tensor: torch.Tensor) -> torch.Tensor:
-    if tensor.grad is None:
-        raise AssertionError("expected a tensor gradient")
-    return tensor.grad
 
 
 def test_fast_lora_keeps_original_bf16_input_and_exact_base_jacobian() -> None:
@@ -110,9 +105,9 @@ def test_fast_lora_keeps_original_bf16_input_and_exact_base_jacobian() -> None:
         actual.backward(grad_output)
     assert "torch_ggml_ops._mmq_launch.default" in dispatched_ops
     assert "torch_ggml_ops._mmq_grad_input_launch.default" in dispatched_ops
-    actual_input_grad = _require_grad(input).detach().clone()
-    actual_a_grad = _require_grad(layer.lora_A["default"].weight).detach().clone()
-    actual_b_grad = _require_grad(layer.lora_B["default"].weight).detach().clone()
+    actual_input_grad = require_grad(input).detach().clone()
+    actual_a_grad = require_grad(layer.lora_A["default"].weight).detach().clone()
+    actual_b_grad = require_grad(layer.lora_B["default"].weight).detach().clone()
 
     logical_weight = dequantize_gguf_tensor(
         payload,
@@ -137,10 +132,10 @@ def test_fast_lora_keeps_original_bf16_input_and_exact_base_jacobian() -> None:
     # GGTensile accumulates the packed Jacobian directly and may differ from
     # dequantize-then-GEMM by one BF16 rounding step.
     torch.testing.assert_close(
-        actual_input_grad, _require_grad(input_ref), rtol=0, atol=8e-3
+        actual_input_grad, require_grad(input_ref), rtol=0, atol=8e-3
     )
-    torch.testing.assert_close(actual_a_grad, _require_grad(a_ref), rtol=0, atol=0)
-    torch.testing.assert_close(actual_b_grad, _require_grad(b_ref), rtol=0, atol=0)
+    torch.testing.assert_close(actual_a_grad, require_grad(a_ref), rtol=0, atol=0)
+    torch.testing.assert_close(actual_b_grad, require_grad(b_ref), rtol=0, atol=0)
     assert layer.base_layer.weight.grad is None
 
     mmq_base = torch_ggml_ops.mmq(
@@ -268,17 +263,17 @@ def test_fast_lora_gdn_projection_uses_generic_dequant_forward() -> None:
 
     torch.testing.assert_close(actual, output_ref, rtol=0, atol=0)
     torch.testing.assert_close(
-        _require_grad(input), _require_grad(input_ref), rtol=0, atol=8e-3
+        require_grad(input), require_grad(input_ref), rtol=0, atol=8e-3
     )
     torch.testing.assert_close(
-        _require_grad(layer.lora_A["default"].weight),
-        _require_grad(a_ref),
+        require_grad(layer.lora_A["default"].weight),
+        require_grad(a_ref),
         rtol=0,
         atol=0,
     )
     torch.testing.assert_close(
-        _require_grad(layer.lora_B["default"].weight),
-        _require_grad(b_ref),
+        require_grad(layer.lora_B["default"].weight),
+        require_grad(b_ref),
         rtol=0,
         atol=0,
     )

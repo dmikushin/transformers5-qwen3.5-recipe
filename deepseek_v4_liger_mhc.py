@@ -15,7 +15,7 @@ cotangent for that path. This avoids a second full activation-gradient
 allocation and a framework add.
 """
 
-from types import MethodType
+from collections.abc import Callable
 from typing import Any
 
 import torch
@@ -25,6 +25,12 @@ from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
     DeepseekV4DecoderLayer,
     DeepseekV4HyperConnection,
     DeepseekV4HyperHead,
+)
+
+from module_patching import (
+    ModulePatchSpec,
+    patch_module_forwards,
+    require_complete_inventory,
 )
 
 _HC = 4
@@ -37,7 +43,8 @@ _SUPPORTED_ROWS = frozenset({2048, 8192, 32768})
 EXPECTED_DEEPSEEK_V4_MHC_CONNECTIONS = 86
 EXPECTED_DEEPSEEK_V4_MHC_DECODER_LAYERS = 43
 EXPECTED_DEEPSEEK_V4_MHC_HEADS = 1
-_MHC_PATCH_MARKER = "_deepseek_v4_liger_mhc"
+_MHC_MARKER = "_patched_deepseek_v4_liger_mhc"
+_SUBJECT = "DeepSeek V4 mHC"
 
 # Values are (block sizes..., num_warps, num_stages). Each kernel is tuned
 # independently because its register pressure and reduction geometry differ.
@@ -1044,102 +1051,118 @@ def _freeze_fp32_control(
         raise ValueError(f"DeepSeek V4 {label} must be contiguous on CUDA/ROCm")
 
 
+class _ControlCounters:
+    """Per-pass counters for the parameter work ``prepare`` performs."""
+
+    def __init__(self) -> None:
+        self.f16_projection_parameters = 0
+        self.converted_projection_parameters = 0
+        self.frozen_control_parameters = 0
+
+
+def _validate_connection(name: str, module: DeepseekV4HyperConnection) -> None:
+    if (
+        module.hc_mult != _HC
+        or module.hc_sinkhorn_iters != _SINKHORN_ITERS
+        or module.fn.shape != (_MIX, _FLAT)
+    ):
+        raise RuntimeError(f"unsupported DeepSeek V4 mHC geometry at {name!r}")
+
+
+def _validate_head(name: str, module: DeepseekV4HyperHead) -> None:
+    if module.hc_mult != _HC or module.hc_fn.shape != (_HC, _FLAT):
+        raise RuntimeError(f"unsupported DeepSeek V4 final mHC geometry at {name!r}")
+
+
+def _prepare_connection(
+    counters: _ControlCounters,
+) -> Callable[[str, DeepseekV4HyperConnection], None]:
+    def prepare(name: str, module: DeepseekV4HyperConnection) -> None:
+        _freeze_fp32_control(module.base, (_MIX,), f"{name}.base")
+        _freeze_fp32_control(module.scale, (3,), f"{name}.scale")
+        counters.frozen_control_parameters += 3
+        if _install_f16_projection_parameter(module, "fn", (_MIX, _FLAT), f"{name}.fn"):
+            counters.converted_projection_parameters += 1
+        counters.f16_projection_parameters += int(module.fn.dtype == torch.float16)
+
+    return prepare
+
+
+def _prepare_head(
+    counters: _ControlCounters,
+) -> Callable[[str, DeepseekV4HyperHead], None]:
+    def prepare(name: str, module: DeepseekV4HyperHead) -> None:
+        _freeze_fp32_control(module.hc_base, (_HC,), f"{name}.hc_base")
+        _freeze_fp32_control(module.hc_scale, (1,), f"{name}.hc_scale")
+        counters.frozen_control_parameters += 3
+        if _install_f16_projection_parameter(
+            module, "hc_fn", (_HC, _FLAT), f"{name}.hc_fn"
+        ):
+            counters.converted_projection_parameters += 1
+        counters.f16_projection_parameters += int(module.hc_fn.dtype == torch.float16)
+
+    return prepare
+
+
+def _mhc_specs(counters: _ControlCounters) -> tuple[ModulePatchSpec[Any], ...]:
+    """Build the fixed DeepSeek V4 mHC inventory for one configuration pass."""
+
+    return (
+        ModulePatchSpec(
+            module_type=DeepseekV4HyperConnection,
+            forward=_patched_mhc_connection_forward,
+            handled_key="connections",
+            validate=_validate_connection,
+            prepare=_prepare_connection(counters),
+            marker=_MHC_MARKER,
+            freeze_weight=False,
+        ),
+        ModulePatchSpec(
+            module_type=DeepseekV4DecoderLayer,
+            forward=_patched_mhc_decoder_forward,
+            handled_key="decoder_layers",
+            marker=_MHC_MARKER,
+            freeze_weight=False,
+        ),
+        ModulePatchSpec(
+            module_type=DeepseekV4HyperHead,
+            forward=_patched_mhc_head_forward,
+            handled_key="heads",
+            validate=_validate_head,
+            prepare=_prepare_head(counters),
+            marker=_MHC_MARKER,
+            freeze_weight=False,
+        ),
+    )
+
+
 def configure_deepseek_v4_liger_mhc(
     model: torch.nn.Module,
 ) -> dict[str, Any]:
     """Install the fixed layer and final-head mHC boundaries on one model."""
 
-    connections = 0
-    decoder_layers = 0
-    heads = 0
-    f16_projections = 0
-    converted_projections = 0
-    frozen_controls = 0
-    already_patched = 0
-    patched_names: list[str] = []
-
-    for name, module in model.named_modules():
-        if isinstance(module, DeepseekV4HyperConnection):
-            connections += 1
-            if (
-                module.hc_mult != _HC
-                or module.hc_sinkhorn_iters != _SINKHORN_ITERS
-                or module.fn.shape != (_MIX, _FLAT)
-            ):
-                raise RuntimeError(f"unsupported DeepSeek V4 mHC geometry at {name!r}")
-            _freeze_fp32_control(module.base, (_MIX,), f"{name}.base")
-            _freeze_fp32_control(module.scale, (3,), f"{name}.scale")
-            frozen_controls += 3
-            if _install_f16_projection_parameter(
-                module, "fn", (_MIX, _FLAT), f"{name}.fn"
-            ):
-                converted_projections += 1
-            f16_projections += int(module.fn.dtype == torch.float16)
-            if getattr(module, _MHC_PATCH_MARKER, False):
-                already_patched += 1
-                continue
-            module.forward = MethodType(_patched_mhc_connection_forward, module)
-            setattr(module, _MHC_PATCH_MARKER, True)
-            patched_names.append(name)
-        elif isinstance(module, DeepseekV4DecoderLayer):
-            decoder_layers += 1
-            if getattr(module, _MHC_PATCH_MARKER, False):
-                already_patched += 1
-                continue
-            module.forward = MethodType(_patched_mhc_decoder_forward, module)
-            setattr(module, _MHC_PATCH_MARKER, True)
-            patched_names.append(name)
-        elif isinstance(module, DeepseekV4HyperHead):
-            heads += 1
-            if module.hc_mult != _HC or module.hc_fn.shape != (_HC, _FLAT):
-                raise RuntimeError(
-                    f"unsupported DeepSeek V4 final mHC geometry at {name!r}"
-                )
-            _freeze_fp32_control(module.hc_base, (_HC,), f"{name}.hc_base")
-            _freeze_fp32_control(module.hc_scale, (1,), f"{name}.hc_scale")
-            frozen_controls += 3
-            if _install_f16_projection_parameter(
-                module, "hc_fn", (_HC, _FLAT), f"{name}.hc_fn"
-            ):
-                converted_projections += 1
-            f16_projections += int(module.hc_fn.dtype == torch.float16)
-            if getattr(module, _MHC_PATCH_MARKER, False):
-                already_patched += 1
-                continue
-            module.forward = MethodType(_patched_mhc_head_forward, module)
-            setattr(module, _MHC_PATCH_MARKER, True)
-            patched_names.append(name)
-
-    return {
-        "connections": connections,
-        "decoder_layers": decoder_layers,
-        "heads": heads,
-        "f16_projection_parameters": f16_projections,
-        "converted_projection_parameters": converted_projections,
-        "frozen_control_parameters": frozen_controls,
-        "patched": len(patched_names),
-        "already_patched": already_patched,
-        "patched_names": patched_names,
-    }
+    counters = _ControlCounters()
+    report = patch_module_forwards(model, _mhc_specs(counters))
+    report["f16_projection_parameters"] = counters.f16_projection_parameters
+    report["converted_projection_parameters"] = counters.converted_projection_parameters
+    report["frozen_control_parameters"] = counters.frozen_control_parameters
+    return report
 
 
 def require_complete_deepseek_v4_liger_mhc(report: dict[str, Any]) -> None:
     """Fail closed unless every fixed DeepSeek V4 mHC site was installed."""
 
-    expected = {
-        "connections": EXPECTED_DEEPSEEK_V4_MHC_CONNECTIONS,
-        "decoder_layers": EXPECTED_DEEPSEEK_V4_MHC_DECODER_LAYERS,
-        "heads": EXPECTED_DEEPSEEK_V4_MHC_HEADS,
-        "f16_projection_parameters": (
-            EXPECTED_DEEPSEEK_V4_MHC_CONNECTIONS + EXPECTED_DEEPSEEK_V4_MHC_HEADS
-        ),
-        "frozen_control_parameters": 3
-        * (EXPECTED_DEEPSEEK_V4_MHC_CONNECTIONS + EXPECTED_DEEPSEEK_V4_MHC_HEADS),
-    }
-    mismatches = {
-        key: (value, report.get(key))
-        for key, value in expected.items()
-        if report.get(key) != value
-    }
-    if mismatches:
-        raise RuntimeError(f"incomplete DeepSeek V4 mHC configuration: {mismatches}")
+    projection_sites = (
+        EXPECTED_DEEPSEEK_V4_MHC_CONNECTIONS + EXPECTED_DEEPSEEK_V4_MHC_HEADS
+    )
+    require_complete_inventory(
+        report,
+        {
+            "connections": EXPECTED_DEEPSEEK_V4_MHC_CONNECTIONS,
+            "decoder_layers": EXPECTED_DEEPSEEK_V4_MHC_DECODER_LAYERS,
+            "heads": EXPECTED_DEEPSEEK_V4_MHC_HEADS,
+            "f16_projection_parameters": projection_sites,
+            "frozen_control_parameters": 3 * projection_sites,
+        },
+        subject=_SUBJECT,
+    )

@@ -22,7 +22,6 @@ evaluated only for the selected 8 or 6 experts, preserving ordinary autograd
 for router-score gradients.
 """
 
-from types import MethodType
 from typing import Any, cast
 
 import torch
@@ -35,6 +34,12 @@ from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
 )
 from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
     Qwen3_5MoeTopKRouter,
+)
+
+from module_patching import (
+    ModulePatchSpec,
+    patch_module_forwards,
+    require_complete_inventory,
 )
 
 _NUM_EXPERTS = 256
@@ -538,68 +543,124 @@ def _bind_router_expert_prior(
     return True
 
 
+_EXPECTED_QWEN_ROUTERS = 40
+_EXPECTED_DEEPSEEK_TOPK_ROUTERS = 40
+_EXPECTED_DEEPSEEK_HASH_ROUTERS = 3
+_QWEN_ROUTER_MARKER = "_patched_qwen_router"
+_DEEPSEEK_TOPK_ROUTER_MARKER = "_patched_deepseek_topk_router"
+_DEEPSEEK_HASH_ROUTER_MARKER = "_patched_deepseek_hash_router"
+
+
+def _validate_qwen_router(name: str, module: Qwen3_5MoeTopKRouter) -> None:
+    if (
+        module.hidden_dim != _QWEN_HIDDEN_SIZE
+        or module.num_experts != _NUM_EXPERTS
+        or module.top_k != _QWEN_TOP_K
+    ):
+        raise RuntimeError(f"Qwen router {name!r} does not match 2048/256/top-8.")
+
+
+def _validate_deepseek_router(
+    name: str,
+    module: DeepseekV4TopKRouter | DeepseekV4HashRouter,
+    scoring_func: Any,
+    *,
+    label: str,
+) -> None:
+    if (
+        module.hidden_dim != _DEEPSEEK_HIDDEN_SIZE
+        or module.num_experts != _NUM_EXPERTS
+        or module.top_k != _DEEPSEEK_TOP_K
+        or scoring_func != "sqrtsoftplus"
+    ):
+        raise RuntimeError(
+            f"{label} {name!r} does not match 4096/256/top-6 sqrtsoftplus."
+        )
+
+
+def _router_specs(
+    base: torch.nn.Module, scoring_func: Any
+) -> tuple[ModulePatchSpec[Any], ...]:
+    """Build the router specs, binding the owning experts prior on every pass."""
+
+    def bind(prior: str):
+        def prepare(name: str, module: torch.nn.Module) -> None:
+            del module
+            _bind_router_expert_prior(base, name, prior)
+
+        return prepare
+
+    def validate_deepseek_topk(name: str, module: DeepseekV4TopKRouter) -> None:
+        _validate_deepseek_router(name, module, scoring_func, label="DeepSeek router")
+
+    def validate_deepseek_hash(name: str, module: DeepseekV4HashRouter) -> None:
+        _validate_deepseek_router(
+            name, module, scoring_func, label="DeepSeek hash router"
+        )
+
+    return (
+        ModulePatchSpec(
+            module_type=Qwen3_5MoeTopKRouter,
+            forward=_qwen_router_forward,
+            handled_key="qwen",
+            validate=_validate_qwen_router,
+            prepare=bind("qwen-learned"),
+            marker=_QWEN_ROUTER_MARKER,
+            freeze_weight=False,
+        ),
+        ModulePatchSpec(
+            module_type=DeepseekV4TopKRouter,
+            forward=_deepseek_topk_router_forward,
+            handled_key="deepseek_topk",
+            validate=validate_deepseek_topk,
+            prepare=bind("deepseek-learned"),
+            marker=_DEEPSEEK_TOPK_ROUTER_MARKER,
+            freeze_weight=False,
+        ),
+        ModulePatchSpec(
+            module_type=DeepseekV4HashRouter,
+            forward=_deepseek_hash_router_forward,
+            handled_key="deepseek_hash",
+            validate=validate_deepseek_hash,
+            prepare=bind("deepseek-hash"),
+            marker=_DEEPSEEK_HASH_ROUTER_MARKER,
+            freeze_weight=False,
+        ),
+    )
+
+
 def configure_fast_moe_ranking(model: torch.nn.Module) -> dict[str, Any]:
     """Install the fixed-shape Qwen or DeepSeek routing-gate implementation."""
 
     get_base_model = getattr(model, "get_base_model", None)
     base = get_base_model() if callable(get_base_model) else model
-    model_type = getattr(getattr(base, "config", None), "model_type", None)
-    scoring_func = getattr(getattr(base, "config", None), "scoring_func", None)
-    paths: dict[str, list[str]] = {"qwen": [], "deepseek_topk": [], "deepseek_hash": []}
+    config = getattr(base, "config", None)
+    model_type = getattr(config, "model_type", None)
+    scoring_func = getattr(config, "scoring_func", None)
 
-    for name, module in base.named_modules():
-        if isinstance(module, Qwen3_5MoeTopKRouter):
-            if (
-                module.hidden_dim != _QWEN_HIDDEN_SIZE
-                or module.num_experts != _NUM_EXPERTS
-                or module.top_k != _QWEN_TOP_K
-            ):
-                raise RuntimeError(
-                    f"Qwen router {name!r} does not match 2048/256/top-8."
-                )
-            module.forward = MethodType(_qwen_router_forward, module)
-            _bind_router_expert_prior(base, name, "qwen-learned")
-            paths["qwen"].append(name)
-        elif isinstance(module, DeepseekV4TopKRouter):
-            if (
-                module.hidden_dim != _DEEPSEEK_HIDDEN_SIZE
-                or module.num_experts != _NUM_EXPERTS
-                or module.top_k != _DEEPSEEK_TOP_K
-                or scoring_func != "sqrtsoftplus"
-            ):
-                raise RuntimeError(
-                    f"DeepSeek router {name!r} does not match 4096/256/top-6 sqrtsoftplus."
-                )
-            module.forward = MethodType(_deepseek_topk_router_forward, module)
-            _bind_router_expert_prior(base, name, "deepseek-learned")
-            paths["deepseek_topk"].append(name)
-        elif isinstance(module, DeepseekV4HashRouter):
-            if (
-                module.hidden_dim != _DEEPSEEK_HIDDEN_SIZE
-                or module.num_experts != _NUM_EXPERTS
-                or module.top_k != _DEEPSEEK_TOP_K
-                or scoring_func != "sqrtsoftplus"
-            ):
-                raise RuntimeError(
-                    f"DeepSeek hash router {name!r} does not match 4096/256/top-6 sqrtsoftplus."
-                )
-            module.forward = MethodType(_deepseek_hash_router_forward, module)
-            _bind_router_expert_prior(base, name, "deepseek-hash")
-            paths["deepseek_hash"].append(name)
-
-    if model_type in {"qwen3_5_moe", "qwen3_5_moe_text"} and len(paths["qwen"]) != 40:
-        raise RuntimeError(f"expected 40 Qwen routers, found {len(paths['qwen'])}")
-    if model_type == "deepseek_v4" and (
-        len(paths["deepseek_topk"]) != 40 or len(paths["deepseek_hash"]) != 3
-    ):
-        raise RuntimeError(
-            "expected 40 learned and 3 hash DeepSeek routers, found "
-            f"{len(paths['deepseek_topk'])} and {len(paths['deepseek_hash'])}"
-        )
-
-    return {
-        "qwen": len(paths["qwen"]),
-        "deepseek_topk": len(paths["deepseek_topk"]),
-        "deepseek_hash": len(paths["deepseek_hash"]),
-        "paths": {key: sorted(value) for key, value in paths.items()},
+    report = patch_module_forwards(base, _router_specs(base, scoring_func))
+    report["paths"] = {
+        key: sorted(names) for key, names in report["handled_by_key"].items()
     }
+    require_complete_fast_moe_ranking(report, model_type)
+    return report
+
+
+def require_complete_fast_moe_ranking(
+    report: dict[str, Any], model_type: str | None = None
+) -> None:
+    """Fail closed unless every router of the model family was handled."""
+
+    if model_type in {"qwen3_5_moe", "qwen3_5_moe_text"}:
+        require_complete_inventory(
+            report, {"qwen": _EXPECTED_QWEN_ROUTERS}, subject="Qwen router"
+        )
+    elif model_type == "deepseek_v4":
+        require_complete_inventory(
+            report,
+            {
+                "deepseek_topk": _EXPECTED_DEEPSEEK_TOPK_ROUTERS,
+                "deepseek_hash": _EXPECTED_DEEPSEEK_HASH_ROUTERS,
+            },
+            subject="DeepSeek V4 router",
+        )

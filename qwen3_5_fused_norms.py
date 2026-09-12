@@ -15,10 +15,10 @@ Semantics preserved:
   that is `FusedRMSNormGated`, i.e. `LayerNormGatedFunction` with `is_rms_norm=True`.
 
 The patched module classes, parameter names, shapes, and dtypes are unchanged, so PEFT
-serialization, the frozen-base contract, and the audit inventories stay valid.
+serialization, the frozen-base contract, and the audit inventories stay valid. The shared
+patching protocol lives in `module_patching.py`.
 """
 
-from types import MethodType
 from typing import Any
 
 import torch
@@ -29,11 +29,18 @@ from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
     Qwen3_5MoeRMSNormGated,
 )
 
+from module_patching import (
+    ModulePatchSpec,
+    patch_module_forwards,
+    require_complete_inventory,
+    require_cuda_weight,
+)
+
 # Text-only Qwen3.5-MoE: 40 input + 40 post-attention + 1 final + 10x2 Q/K head norms,
 # and one gated norm per GatedDeltaNet layer.
 EXPECTED_RMSNORMS = 101
 EXPECTED_GATED_RMSNORMS = 30
-_PATCH_MARKER = "_fused_norm"
+_SUBJECT = "Qwen3.5 fused norm"
 _LIGER_OFFSET = 1.0
 _LIGER_CASTING_MODE = "gemma"
 _LIGER_IN_PLACE = False
@@ -75,66 +82,46 @@ def _fla_gated_rmsnorm_forward(
     )
 
 
-def _require_cuda_weight(name: str, module: torch.nn.Module) -> None:
-    weight = getattr(module, "weight", None)
-    if not isinstance(weight, torch.Tensor) or not weight.is_floating_point():
-        raise RuntimeError(f"Qwen3.5 fused norm {name!r} has no floating weight")
-    if weight.device.type != "cuda":
+def _validate_rmsnorm(name: str, module: Qwen3_5MoeRMSNorm) -> None:
+    require_cuda_weight(name, module, subject=_SUBJECT)
+
+
+def _validate_gated_rmsnorm(name: str, module: Qwen3_5MoeRMSNormGated) -> None:
+    require_cuda_weight(name, module, subject=_SUBJECT)
+    if module.activation not in _FLA_ACTIVATIONS:
         raise RuntimeError(
-            f"Qwen3.5 fused norm {name!r} requires a CUDA/ROCm weight, got {weight.device}"
+            f"Qwen3.5 gated RMSNorm {name!r} uses unsupported activation "
+            f"{module.activation!r}"
         )
+
+
+_SPECS = (
+    ModulePatchSpec(
+        module_type=Qwen3_5MoeRMSNormGated,
+        forward=_fla_gated_rmsnorm_forward,
+        handled_key="gated_rmsnorms",
+        validate=_validate_gated_rmsnorm,
+    ),
+    ModulePatchSpec(
+        module_type=Qwen3_5MoeRMSNorm,
+        forward=_liger_rmsnorm_forward,
+        handled_key="rmsnorms",
+        validate=_validate_rmsnorm,
+    ),
+)
 
 
 def configure_qwen35_fused_norms(model: torch.nn.Module) -> dict[str, Any]:
     """Install the Liger and FLA kernels on one loaded Qwen3.5-MoE model."""
 
-    rmsnorms = 0
-    gated_rmsnorms = 0
-    already_patched = 0
-    patched_names: list[str] = []
-
-    for name, module in model.named_modules():
-        if isinstance(module, Qwen3_5MoeRMSNormGated):
-            _require_cuda_weight(name, module)
-            if module.activation not in _FLA_ACTIVATIONS:
-                raise RuntimeError(
-                    f"Qwen3.5 gated RMSNorm {name!r} uses unsupported activation "
-                    f"{module.activation!r}"
-                )
-            module.weight.requires_grad_(False)
-            if getattr(module, _PATCH_MARKER, False):
-                already_patched += 1
-                gated_rmsnorms += 1
-                continue
-            module.forward = MethodType(_fla_gated_rmsnorm_forward, module)
-            setattr(module, _PATCH_MARKER, True)
-            gated_rmsnorms += 1
-            patched_names.append(name)
-        elif isinstance(module, Qwen3_5MoeRMSNorm):
-            _require_cuda_weight(name, module)
-            module.weight.requires_grad_(False)
-            if getattr(module, _PATCH_MARKER, False):
-                already_patched += 1
-                rmsnorms += 1
-                continue
-            module.forward = MethodType(_liger_rmsnorm_forward, module)
-            setattr(module, _PATCH_MARKER, True)
-            rmsnorms += 1
-            patched_names.append(name)
-
-    return {
-        "rmsnorms": rmsnorms,
-        "gated_rmsnorms": gated_rmsnorms,
-        "patched": len(patched_names),
-        "already_patched": already_patched,
-        "liger": {
-            "offset": _LIGER_OFFSET,
-            "casting_mode": _LIGER_CASTING_MODE,
-            "in_place": _LIGER_IN_PLACE,
-        },
-        "fla": {"activation": "silu", "is_rms_norm": True},
-        "patched_names": patched_names,
+    report = patch_module_forwards(model, _SPECS)
+    report["liger"] = {
+        "offset": _LIGER_OFFSET,
+        "casting_mode": _LIGER_CASTING_MODE,
+        "in_place": _LIGER_IN_PLACE,
     }
+    report["fla"] = {"activation": "silu", "is_rms_norm": True}
+    return report
 
 
 def require_complete_qwen35_fused_norms(
@@ -145,14 +132,11 @@ def require_complete_qwen35_fused_norms(
 ) -> None:
     """Fail closed unless the fixed Qwen3.5-MoE norm inventory was handled."""
 
-    expected = {
-        "rmsnorms": expected_rmsnorms,
-        "gated_rmsnorms": expected_gated_rmsnorms,
-    }
-    mismatches = {
-        key: (value, report.get(key))
-        for key, value in expected.items()
-        if report.get(key) != value
-    }
-    if mismatches:
-        raise RuntimeError(f"incomplete Qwen3.5 fused norm configuration: {mismatches}")
+    require_complete_inventory(
+        report,
+        {
+            "rmsnorms": expected_rmsnorms,
+            "gated_rmsnorms": expected_gated_rmsnorms,
+        },
+        subject=_SUBJECT,
+    )

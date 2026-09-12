@@ -8,6 +8,7 @@ from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
     Qwen3_5MoeRMSNormGated,
 )
 
+from module_patching import PATCH_MARKER
 from qwen3_5_fused_norms import (
     EXPECTED_GATED_RMSNORMS,
     EXPECTED_RMSNORMS,
@@ -16,32 +17,10 @@ from qwen3_5_fused_norms import (
     configure_qwen35_fused_norms,
     require_complete_qwen35_fused_norms,
 )
+from test_support import assert_close_mixed_precision, require_grad
 
 _MIN_COSINE = 0.999
 _MAX_RELATIVE_RMSE = 0.005
-
-
-def _require_grad(tensor: torch.Tensor) -> torch.Tensor:
-    if tensor.grad is None:
-        raise AssertionError("expected a tensor gradient")
-    return tensor.grad
-
-
-def _assert_close_mixed_precision(
-    candidate: torch.Tensor, reference: torch.Tensor
-) -> None:
-    reference_flat = reference.detach().float().flatten()
-    candidate_flat = candidate.detach().float().flatten()
-    assert torch.isfinite(reference_flat).all()
-    assert torch.isfinite(candidate_flat).all()
-    cosine = torch.nn.functional.cosine_similarity(
-        reference_flat, candidate_flat, dim=0
-    )
-    relative_rmse = (candidate_flat - reference_flat).square().mean().sqrt() / (
-        reference_flat.square().mean().sqrt() + 1e-12
-    )
-    assert float(cosine) >= _MIN_COSINE
-    assert float(relative_rmse) <= _MAX_RELATIVE_RMSE
 
 
 def _randomize(weight: torch.Tensor, generator: torch.Generator) -> None:
@@ -115,9 +94,17 @@ def test_liger_rmsnorm_matches_eager_reference(width: int) -> None:
     reference_output.backward(grad_output)
     candidate_output.backward(grad_output)
 
-    _assert_close_mixed_precision(candidate_output, reference_output)
-    _assert_close_mixed_precision(
-        _require_grad(candidate_input), _require_grad(reference_input)
+    assert_close_mixed_precision(
+        candidate_output,
+        reference_output,
+        minimum_cosine=_MIN_COSINE,
+        maximum_relative_rmse=_MAX_RELATIVE_RMSE,
+    )
+    assert_close_mixed_precision(
+        require_grad(candidate_input),
+        require_grad(reference_input),
+        minimum_cosine=_MIN_COSINE,
+        maximum_relative_rmse=_MAX_RELATIVE_RMSE,
     )
     assert candidate.norm.weight.grad is None
     assert reference.norm.weight.grad is None
@@ -156,12 +143,23 @@ def test_fla_gated_rmsnorm_matches_eager_reference() -> None:
     reference_output.backward(grad_output)
     candidate_output.backward(grad_output)
 
-    _assert_close_mixed_precision(candidate_output, reference_output)
-    _assert_close_mixed_precision(
-        _require_grad(candidate_input), _require_grad(reference_input)
+    assert_close_mixed_precision(
+        candidate_output,
+        reference_output,
+        minimum_cosine=_MIN_COSINE,
+        maximum_relative_rmse=_MAX_RELATIVE_RMSE,
     )
-    _assert_close_mixed_precision(
-        _require_grad(candidate_gate), _require_grad(reference_gate)
+    assert_close_mixed_precision(
+        require_grad(candidate_input),
+        require_grad(reference_input),
+        minimum_cosine=_MIN_COSINE,
+        maximum_relative_rmse=_MAX_RELATIVE_RMSE,
+    )
+    assert_close_mixed_precision(
+        require_grad(candidate_gate),
+        require_grad(reference_gate),
+        minimum_cosine=_MIN_COSINE,
+        maximum_relative_rmse=_MAX_RELATIVE_RMSE,
     )
     assert norm.weight.grad is None
     assert reference.linear_attn.norm.weight.grad is None
@@ -173,7 +171,7 @@ def test_patched_full_inventory_is_required_and_idempotent() -> None:
     require_complete_qwen35_fused_norms(report)
     assert report["patched"] == EXPECTED_RMSNORMS + EXPECTED_GATED_RMSNORMS
     assert report["already_patched"] == 0
-    assert not getattr(model.untouched, "_fused_norm", False)
+    assert not getattr(model.untouched, PATCH_MARKER, False)
 
     again = configure_qwen35_fused_norms(model)
     require_complete_qwen35_fused_norms(again)

@@ -23,6 +23,7 @@ from deepseek_v4_liger_loss import (
     deepseek_v4_packed_liger_causal_lm_loss,
 )
 from packed_liger_loss import PackedLossResult
+from test_support import require_grad
 
 _MODEL = Path(
     os.environ.get(
@@ -30,12 +31,6 @@ _MODEL = Path(
         os.path.expanduser("~/models/ds4/DeepSeek-V4-Flash-IQ2XXS.gguf"),
     )
 )
-
-
-def _require_grad(tensor: torch.Tensor) -> torch.Tensor:
-    if tensor.grad is None:
-        raise AssertionError("expected a tensor gradient")
-    return tensor.grad
 
 
 def _q8_lm_head(weight: np.ndarray) -> GgufLinear:
@@ -191,12 +186,12 @@ def test_scoped_q8_0_liger_loss_matches_logical_reference() -> None:
 
     torch.testing.assert_close(scoped, reference, rtol=0, atol=0)
     torch.testing.assert_close(
-        _require_grad(hidden_scoped), _require_grad(hidden_reference), rtol=0, atol=0
+        require_grad(hidden_scoped), require_grad(hidden_reference), rtol=0, atol=0
     )
     assert materializations == 1
     assert head.weight.grad is None
     assert torch.isfinite(scoped)
-    assert torch.isfinite(_require_grad(hidden_scoped)).all()
+    assert torch.isfinite(require_grad(hidden_scoped)).all()
 
 
 def test_packed_q8_0_liger_loss_uses_native_mmq_without_materializing_head() -> None:
@@ -266,4 +261,4 @@ def test_packed_q8_0_liger_loss_uses_native_mmq_without_materializing_head() -> 
     assert materializations == 0
     assert "torch_ggml_ops._mmq_launch.default" in operations
     assert "torch_ggml_ops._mmq_grad_input_launch.default" in operations
-    assert torch.isfinite(_require_grad(hidden_packed)).all()
+    assert torch.isfinite(require_grad(hidden_packed)).all()

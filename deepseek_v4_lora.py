@@ -1,5 +1,4 @@
 import re
-from types import MethodType
 from typing import Any
 
 import torch
@@ -11,6 +10,11 @@ from transformers.integrations.gguf.gguf_quantized_parameter import (
 from transformers.integrations.gguf.modules import GgufGroupedLinear, GgufLinear
 
 from fast_lora import FastGgufLoraLinear, FastLoraLinear
+from module_patching import (
+    ModulePatchSpec,
+    patch_module_forwards,
+    require_complete_inventory,
+)
 
 ORDINARY_TARGET_MODULES = frozenset(
     {
@@ -121,6 +125,39 @@ def _deepseek_v4_fixed_grouped_mmq_forward(
     return output.to(original_input_dtype)
 
 
+_GROUPED_MMQ_MARKER = "_patched_deepseek_v4_grouped_mmq"
+EXPECTED_DEEPSEEK_V4_GROUPED_MMQ = 43
+
+
+def _validate_grouped_mmq(name: str, module: GgufGroupedLinear) -> None:
+    if not isinstance(module.weight, GgufQuantizedParameter):
+        raise TypeError(f"DeepSeek grouped projection {name!r} is not GGUF-quantized.")
+    supported = (
+        int(module.weight.quant_type) == 8
+        and module.n_groups == 8
+        and module.in_features == 4096
+        and module.out_features % 8 == 0
+        and module.out_features // 8 == 1024
+    )
+    if not supported:
+        raise RuntimeError(
+            "DeepSeek grouped projection does not match the fixed eight-group "
+            f"Q8_0 4096->1024 contract: {name!r}."
+        )
+
+
+_GROUPED_MMQ_SPECS = (
+    ModulePatchSpec(
+        module_type=GgufGroupedLinear,
+        forward=_deepseek_v4_fixed_grouped_mmq_forward,
+        handled_key="enabled",
+        validate=_validate_grouped_mmq,
+        marker=_GROUPED_MMQ_MARKER,
+        freeze_weight=False,
+    ),
+)
+
+
 def configure_deepseek_v4_grouped_mmq(model: torch.nn.Module) -> dict[str, Any]:
     """Install the native fixed-grouped Q8_0 path on one model instance.
 
@@ -132,31 +169,19 @@ def configure_deepseek_v4_grouped_mmq(model: torch.nn.Module) -> dict[str, Any]:
 
     get_base_model = getattr(model, "get_base_model", None)
     base = get_base_model() if callable(get_base_model) else model
-    paths: list[str] = []
-    for name, module in base.named_modules():
-        if not isinstance(module, GgufGroupedLinear):
-            continue
-        if not isinstance(module.weight, GgufQuantizedParameter):
-            raise TypeError(
-                f"DeepSeek grouped projection {name!r} is not GGUF-quantized."
-            )
-        supported = (
-            int(module.weight.quant_type) == 8
-            and module.n_groups == 8
-            and module.in_features == 4096
-            and module.out_features % 8 == 0
-            and module.out_features // 8 == 1024
-        )
-        if not supported:
-            raise RuntimeError(
-                "DeepSeek grouped projection does not match the fixed eight-group "
-                f"Q8_0 4096->1024 contract: {name!r}."
-            )
-        if not getattr(module, "_deepseek_v4_grouped_mmq_enabled", False):
-            module.forward = MethodType(_deepseek_v4_fixed_grouped_mmq_forward, module)
-            module._deepseek_v4_grouped_mmq_enabled = True
-        paths.append(name)
-    return {"enabled": len(paths), "paths": sorted(paths)}
+    report = patch_module_forwards(base, _GROUPED_MMQ_SPECS)
+    report["paths"] = sorted(report["handled_by_key"]["enabled"])
+    return report
+
+
+def require_complete_deepseek_v4_grouped_mmq(report: dict[str, Any]) -> None:
+    """Fail closed unless every fixed DeepSeek V4 grouped projection was handled."""
+
+    require_complete_inventory(
+        report,
+        {"enabled": EXPECTED_DEEPSEEK_V4_GROUPED_MMQ},
+        subject="DeepSeek V4 grouped MMQ",
+    )
 
 
 def normalize_peft_path(path: str) -> str:

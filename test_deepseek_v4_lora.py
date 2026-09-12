@@ -19,7 +19,9 @@ from deepseek_v4_lora import (
     _RejectedDeepseekV4GroupedLora,
     configure_deepseek_v4_grouped_mmq,
     register_deepseek_v4_lora,
+    require_complete_deepseek_v4_grouped_mmq,
 )
+from test_support import require_grad
 
 _MODEL = Path(
     os.environ.get(
@@ -27,12 +29,6 @@ _MODEL = Path(
         os.path.expanduser("~/models/ds4/DeepSeek-V4-Flash-IQ2XXS.gguf"),
     )
 )
-
-
-def _require_grad(tensor: torch.Tensor) -> torch.Tensor:
-    if tensor.grad is None:
-        raise AssertionError("expected a tensor gradient")
-    return tensor.grad
 
 
 class _RecordOps(TorchDispatchMode):
@@ -152,6 +148,11 @@ def test_fixed_grouped_q8_0_mmq_matches_dense_packed_reference() -> None:
     )
     report = configure_deepseek_v4_grouped_mmq(grouped)
     assert report["enabled"] == 1
+    assert report["patched"] == 1
+    again = configure_deepseek_v4_grouped_mmq(grouped)
+    assert again["enabled"] == 1
+    assert again["patched"] == 0
+    assert again["already_patched"] == 1
 
     hidden = torch.randn(
         2048, 8, 4096, device="cuda", dtype=torch.bfloat16, requires_grad=True
@@ -162,7 +163,7 @@ def test_fixed_grouped_q8_0_mmq_matches_dense_packed_reference() -> None:
     grad_output = torch.stack(grad_output_groups, dim=1)
     actual = grouped(hidden)
     actual.backward(grad_output)
-    actual_grad = _require_grad(hidden).detach().clone()
+    actual_grad = require_grad(hidden).detach().clone()
 
     hidden_reference = hidden.detach().clone().requires_grad_(True)
     packed_groups = packed.reshape(8, 1024, -1)
@@ -221,3 +222,8 @@ def test_grouped_output_lora_is_explicitly_rejected() -> None:
             lora_bias=False,
             ephemeral_gpu_offload=False,
         )
+
+
+def test_grouped_mmq_gate_rejects_incomplete_inventory() -> None:
+    with pytest.raises(RuntimeError, match="incomplete DeepSeek V4 grouped MMQ"):
+        require_complete_deepseek_v4_grouped_mmq({"enabled": 42})

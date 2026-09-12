@@ -27,6 +27,7 @@ from fast_moe_lora import (
     gguf_mmq_aiter_lora_forward,
 )
 from gguf_support import dequantize_gguf_tensor
+from test_support import require_grad
 
 
 class _RecordOps(TorchDispatchMode):
@@ -45,12 +46,6 @@ _MODEL = Path(
         os.path.expanduser("~/models/qwen3.6/Qwen3.6-35B-A3B-APEX-I-Mini.gguf"),
     )
 )
-
-
-def _require_grad(tensor: torch.Tensor) -> torch.Tensor:
-    if tensor.grad is None:
-        raise AssertionError("expected a tensor gradient")
-    return tensor.grad
 
 
 @pytest.fixture(autouse=True)
@@ -199,7 +194,7 @@ def test_packed_expert_projection_backward_is_exact_logical_jacobian(
     # Paired packed backward combines both terms in one FP32 accumulator and
     # rounds once to BF16, so Torch GEMM may differ only by reduction order.
     torch.testing.assert_close(
-        _require_grad(hidden), expected_hidden_grad, rtol=0, atol=2e-2
+        require_grad(hidden), expected_hidden_grad, rtol=0, atol=2e-2
     )
     assert gate.grad is None
     assert up.grad is None
@@ -246,7 +241,7 @@ def test_packed_expert_projection_backward_is_exact_logical_jacobian(
         expert_prior="qwen-learned",
     )
     torch.testing.assert_close(
-        _require_grad(intermediate), expected_intermediate_grad, rtol=0, atol=0
+        require_grad(intermediate), expected_intermediate_grad, rtol=0, atol=0
     )
     assert down.grad is None
 

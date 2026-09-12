@@ -12,15 +12,11 @@ from deepseek_v4_liger_rmsnorm import (
     _LigerFrozenWeightRMSNormFunction,
     configure_deepseek_v4_liger_rmsnorm,
 )
+from module_patching import PATCH_MARKER
+from test_support import assert_close_mixed_precision, require_grad
 
 _MIN_RMSNORM_COSINE = 0.999
 _MAX_RMSNORM_RELATIVE_RMSE = 0.005
-
-
-def _require_grad(tensor: torch.Tensor) -> torch.Tensor:
-    if tensor.grad is None:
-        raise AssertionError("expected a tensor gradient")
-    return tensor.grad
 
 
 class _NormToy(torch.nn.Module):
@@ -41,28 +37,6 @@ def _frozen_pair(width: int) -> tuple[_NormToy, _NormToy]:
     reference.requires_grad_(False)
     candidate.requires_grad_(False)
     return reference, candidate
-
-
-def _assert_close_mixed_precision(
-    candidate: torch.Tensor,
-    reference: torch.Tensor,
-    *,
-    minimum_cosine: float,
-    maximum_relative_rmse: float,
-) -> None:
-    reference_flat = reference.detach().float().flatten()
-    candidate_flat = candidate.detach().float().flatten()
-    assert torch.isfinite(reference_flat).all()
-    assert torch.isfinite(candidate_flat).all()
-    delta = candidate_flat - reference_flat
-    cosine = torch.nn.functional.cosine_similarity(
-        reference_flat, candidate_flat, dim=0
-    )
-    relative_rmse = delta.square().mean().sqrt() / (
-        reference_flat.square().mean().sqrt() + 1e-12
-    )
-    assert float(cosine) >= minimum_cosine
-    assert float(relative_rmse) <= maximum_relative_rmse
 
 
 @pytest.mark.parametrize("width", [128, 512, 1024, 4096])
@@ -89,15 +63,15 @@ def test_liger_frozen_weight_rmsnorm_meets_accuracy_gate(
     candidate_output.backward(output_gradient.clone())
 
     assert candidate_output.dtype == torch.bfloat16
-    _assert_close_mixed_precision(
+    assert_close_mixed_precision(
         candidate_output,
         reference_output,
         minimum_cosine=_MIN_RMSNORM_COSINE,
         maximum_relative_rmse=_MAX_RMSNORM_RELATIVE_RMSE,
     )
-    _assert_close_mixed_precision(
-        _require_grad(candidate_x),
-        _require_grad(reference_x),
+    assert_close_mixed_precision(
+        require_grad(candidate_x),
+        require_grad(reference_x),
         minimum_cosine=_MIN_RMSNORM_COSINE,
         maximum_relative_rmse=_MAX_RMSNORM_RELATIVE_RMSE,
     )
@@ -111,7 +85,7 @@ def test_width_128_weighted_norm_uses_tuned_launch_geometry() -> None:
     assert report["weighted"] == 1
     assert report["skipped_weighted_128"] == 0
     assert not candidate.norm.weight.requires_grad
-    assert candidate.norm._deepseek_v4_liger_rmsnorm
+    assert getattr(candidate.norm, PATCH_MARKER)
 
 
 def test_in_place_backward_is_stable_on_branched_norm_output() -> None:
@@ -139,15 +113,15 @@ def test_in_place_backward_is_stable_on_branched_norm_output() -> None:
     reference_loss.backward()
     candidate_loss.backward()
 
-    _assert_close_mixed_precision(
+    assert_close_mixed_precision(
         candidate_loss,
         reference_loss,
         minimum_cosine=_MIN_RMSNORM_COSINE,
         maximum_relative_rmse=_MAX_RMSNORM_RELATIVE_RMSE,
     )
-    _assert_close_mixed_precision(
-        _require_grad(candidate_x),
-        _require_grad(reference_x),
+    assert_close_mixed_precision(
+        require_grad(candidate_x),
+        require_grad(reference_x),
         minimum_cosine=_MIN_RMSNORM_COSINE,
         maximum_relative_rmse=_MAX_RMSNORM_RELATIVE_RMSE,
     )
@@ -167,15 +141,15 @@ def test_q_b_scale_free_liger_norm_matches_strict_gradient() -> None:
     reference_output.backward(output_gradient.clone())
     candidate_output.backward(output_gradient.clone())
 
-    _assert_close_mixed_precision(
+    assert_close_mixed_precision(
         candidate_output,
         reference_output,
         minimum_cosine=0.99999,
         maximum_relative_rmse=0.005,
     )
-    _assert_close_mixed_precision(
-        _require_grad(candidate_x),
-        _require_grad(reference_x),
+    assert_close_mixed_precision(
+        require_grad(candidate_x),
+        require_grad(reference_x),
         minimum_cosine=0.99999,
         maximum_relative_rmse=0.005,
     )
@@ -224,7 +198,7 @@ def test_base_model_patch_survives_lora_injection() -> None:
     model(x).float().square().mean().backward()
 
     patched_base = model.base_model.model
-    assert patched_base.norm._deepseek_v4_liger_rmsnorm
+    assert getattr(patched_base.norm, PATCH_MARKER)
     assert patched_base.norm.weight.grad is None
     assert patched_base.q_a_proj.lora_B["default"].weight.grad is not None
 

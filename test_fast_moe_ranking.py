@@ -19,6 +19,7 @@ from fast_moe_ranking import (
     configure_fast_moe_ranking,
     router_topk_indices,
 )
+from test_support import assert_relative_rmse, require_grad
 
 
 def _qwen_config() -> SimpleNamespace:
@@ -117,19 +118,6 @@ def _assert_finite_nonzero_gradient(tensor: torch.Tensor) -> None:
     assert bool(torch.any(tensor != 0))
 
 
-def _assert_relative_rmse(
-    actual: torch.Tensor,
-    reference: torch.Tensor,
-    maximum: float,
-) -> None:
-    actual_float = actual.detach().double().reshape(-1)
-    reference_float = reference.detach().double().reshape(-1)
-    delta_rmse = (actual_float - reference_float).square().mean().sqrt()
-    reference_rms = reference_float.square().mean().sqrt().clamp_min(1e-12)
-    relative_rmse = float(delta_rmse / reference_rms)
-    assert relative_rmse <= maximum, (relative_rmse, maximum)
-
-
 class _RecordOps(TorchDispatchMode):
     def __init__(self, dispatched_ops: list[str]) -> None:
         super().__init__()
@@ -174,12 +162,6 @@ def _deepseek_fp32_reference(
     weights = scores.gather(1, indices)
     weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20)
     return logits, weights * router.routed_scaling_factor, indices
-
-
-def _require_grad(tensor: torch.Tensor) -> torch.Tensor:
-    if tensor.grad is None:
-        raise AssertionError("expected a tensor gradient")
-    return tensor.grad
 
 
 @pytest.mark.parametrize(
@@ -255,15 +237,15 @@ def test_qwen_router_matches_reference_forward_and_gradient() -> None:
     # match the full-FP32 oracle only to the single BF16 output rounding
     # (measured 1.7e-3 relative RMSE). The selected weights below are still
     # gated against the full-FP32 reference.
-    _assert_relative_rmse(logits_optimized, logits_reference, 1e-2)
+    assert_relative_rmse(logits_optimized, logits_reference, 1e-2)
     _assert_selected_weights_close(weights_optimized, weights_reference)
 
     loss_reference = _symmetric_weight_loss(weights_reference)
     loss_optimized = _symmetric_weight_loss(weights_optimized)
     loss_reference.backward()
     loss_optimized.backward()
-    _assert_finite_nonzero_gradient(_require_grad(hidden_reference))
-    _assert_finite_nonzero_gradient(_require_grad(hidden_optimized))
+    _assert_finite_nonzero_gradient(require_grad(hidden_reference))
+    _assert_finite_nonzero_gradient(require_grad(hidden_optimized))
 
 
 def test_deepseek_router_matches_reference_forward_and_gradient() -> None:
@@ -293,15 +275,15 @@ def test_deepseek_router_matches_reference_forward_and_gradient() -> None:
     assert logits_optimized.dtype == torch.float32
     assert weights_optimized.dtype == torch.float32
     # Same intentional BF16 projection rounding as the Qwen router test.
-    _assert_relative_rmse(logits_optimized, logits_reference, 1e-2)
+    assert_relative_rmse(logits_optimized, logits_reference, 1e-2)
     _assert_selected_weights_close(weights_optimized, weights_reference)
 
     loss_reference = _symmetric_weight_loss(weights_reference)
     loss_optimized = _symmetric_weight_loss(weights_optimized)
     loss_reference.backward()
     loss_optimized.backward()
-    _assert_finite_nonzero_gradient(_require_grad(hidden_reference))
-    _assert_finite_nonzero_gradient(_require_grad(hidden_optimized))
+    _assert_finite_nonzero_gradient(require_grad(hidden_reference))
+    _assert_finite_nonzero_gradient(require_grad(hidden_optimized))
 
 
 def test_router_ties_accept_any_expert_at_the_kth_threshold() -> None:
@@ -365,7 +347,7 @@ def test_deepseek_hash_router_avoids_full_width_score_materialization() -> None:
         )
     )
     # Same intentional BF16 projection rounding as the other router tests.
-    _assert_relative_rmse(
+    assert_relative_rmse(
         actual_logits,
         expected_logits.gather(1, expected_indices),
         1e-2,
@@ -402,11 +384,11 @@ def test_deepseek_hash_router_selected_logits_gradient_matches_reference() -> No
     _symmetric_weight_loss(weights_reference).backward()
     _symmetric_weight_loss(weights_optimized).backward()
 
-    _assert_finite_nonzero_gradient(_require_grad(hidden_reference))
-    _assert_finite_nonzero_gradient(_require_grad(hidden_optimized))
-    _assert_relative_rmse(
-        _require_grad(hidden_optimized),
-        _require_grad(hidden_reference),
+    _assert_finite_nonzero_gradient(require_grad(hidden_reference))
+    _assert_finite_nonzero_gradient(require_grad(hidden_optimized))
+    assert_relative_rmse(
+        require_grad(hidden_optimized),
+        require_grad(hidden_reference),
         1e-2,
     )
 

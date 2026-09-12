@@ -5,7 +5,7 @@ from transformers.integrations.gguf import dequant as gguf_dequant
 from transformers.integrations.gguf import gguf_quantized_parameter
 from transformers.integrations.gguf import kernels as gguf_kernels
 
-_PATCH_MARKER = "_torch_compile_patch"
+_PATCH_MARKER = "_patched_compiled_dequantize"
 _RECOMPILE_LIMIT = 64
 
 

@@ -12,7 +12,6 @@ fusion.
 """
 
 import math
-from types import MethodType
 from typing import Any
 
 import torch
@@ -26,11 +25,18 @@ from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
     DeepseekV4UnweightedRMSNorm,
 )
 
+from module_patching import (
+    ModulePatchSpec,
+    patch_module_forwards,
+    require_complete_inventory,
+    require_cuda_weight,
+)
+
 EXPECTED_WEIGHTED_RMSNORMS = 235
 EXPECTED_SKIPPED_WEIGHTED_128_RMSNORMS = 0
 EXPECTED_Q_B_RMSNORMS = 43
 EXPECTED_SKIPPED_MHC_RMSNORMS = 87
-_PATCH_MARKER = "_deepseek_v4_liger_rmsnorm"
+_SUBJECT = "DeepSeek V4 Liger RMSNorm"
 _LIGER_WEIGHTED_CASTING_MODE = "llama"
 
 
@@ -190,76 +196,59 @@ def _unweighted_liger_forward(
     )
 
 
+def _validate_weighted_rmsnorm(name: str, module: DeepseekV4RMSNorm) -> None:
+    require_cuda_weight(name, module, subject=_SUBJECT)
+    if module.weight.dtype != torch.float32:
+        raise RuntimeError(
+            "DeepSeek weighted Liger RMSNorm requires an FP32 scale vector. "
+            f"{name!r} has {module.weight.dtype}"
+        )
+
+
+def _is_q_b_norm(name: str, module: DeepseekV4UnweightedRMSNorm) -> bool:
+    del module
+    return name.endswith("q_b_norm")
+
+
+_SPECS = (
+    ModulePatchSpec(
+        module_type=DeepseekV4RMSNorm,
+        forward=_weighted_liger_forward,
+        handled_key="weighted",
+        validate=_validate_weighted_rmsnorm,
+    ),
+    ModulePatchSpec(
+        module_type=DeepseekV4UnweightedRMSNorm,
+        forward=_unweighted_liger_forward,
+        handled_key="q_b_unweighted",
+        accept=_is_q_b_norm,
+        skip_key="skipped_mhc_unweighted",
+    ),
+)
+
+
 def configure_deepseek_v4_liger_rmsnorm(
     model: torch.nn.Module,
 ) -> dict[str, Any]:
     """Patch the accepted weighted and Q-B norms on one frozen model."""
 
-    weighted = 0
-    skipped_weighted_128 = 0
-    q_b = 0
-    skipped_mhc = 0
-    already_patched = 0
-    patched_names: list[str] = []
-
-    for name, module in model.named_modules():
-        if isinstance(module, DeepseekV4RMSNorm):
-            # Norm scales are outside the fixed LoRA target contract. Freeze
-            # them here so this base-model patch does not depend on PEFT order.
-            module.weight.requires_grad_(False)
-            if getattr(module, _PATCH_MARKER, False):
-                already_patched += 1
-                weighted += 1
-                continue
-            if module.weight.dtype != torch.float32:
-                raise RuntimeError(
-                    "DeepSeek weighted Liger RMSNorm requires an FP32 scale vector. "
-                    f"{name!r} has {module.weight.dtype}"
-                )
-            module.forward = MethodType(_weighted_liger_forward, module)
-            setattr(module, _PATCH_MARKER, True)
-            weighted += 1
-            patched_names.append(name)
-        elif isinstance(module, DeepseekV4UnweightedRMSNorm):
-            if name.endswith("q_b_norm"):
-                if getattr(module, _PATCH_MARKER, False):
-                    already_patched += 1
-                    q_b += 1
-                    continue
-                module.forward = MethodType(_unweighted_liger_forward, module)
-                setattr(module, _PATCH_MARKER, True)
-                q_b += 1
-                patched_names.append(name)
-            else:
-                skipped_mhc += 1
-
-    return {
-        "weighted": weighted,
-        "skipped_weighted_128": skipped_weighted_128,
-        "q_b_unweighted": q_b,
-        "skipped_mhc_unweighted": skipped_mhc,
-        "patched": len(patched_names),
-        "already_patched": already_patched,
-        "backward": "in_place_frozen_dx_only",
-        "patched_names": patched_names,
-    }
+    report = patch_module_forwards(
+        model, _SPECS, declared_keys=("skipped_weighted_128",)
+    )
+    report["backward"] = "in_place_frozen_dx_only"
+    return report
 
 
 def require_complete_deepseek_v4_liger_rmsnorm(report: dict[str, Any]) -> None:
     """Fail closed unless the fixed DeepSeek V4 norm inventory was handled."""
 
-    expected = {
-        "weighted": EXPECTED_WEIGHTED_RMSNORMS,
-        "skipped_weighted_128": EXPECTED_SKIPPED_WEIGHTED_128_RMSNORMS,
-        "q_b_unweighted": EXPECTED_Q_B_RMSNORMS,
-        "skipped_mhc_unweighted": EXPECTED_SKIPPED_MHC_RMSNORMS,
-    }
-    mismatches = {
-        key: (expected_value, report.get(key))
-        for key, expected_value in expected.items()
-        if report.get(key) != expected_value
-    }
-    if mismatches:
-        raise RuntimeError(
-            f"incomplete DeepSeek V4 Liger RMSNorm configuration: {mismatches}"
-        )
+    require_complete_inventory(
+        report,
+        {
+            "weighted": EXPECTED_WEIGHTED_RMSNORMS,
+            "skipped_weighted_128": EXPECTED_SKIPPED_WEIGHTED_128_RMSNORMS,
+            "q_b_unweighted": EXPECTED_Q_B_RMSNORMS,
+            "skipped_mhc_unweighted": EXPECTED_SKIPPED_MHC_RMSNORMS,
+        },
+        subject=_SUBJECT,
+    )

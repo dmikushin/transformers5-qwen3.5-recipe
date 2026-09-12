@@ -36,6 +36,7 @@ _PACKED_LM_HEAD_CHUNK_SIZE = 512
 _PACKED_LM_HEAD_QUANT_TYPE = 8
 _PACKED_LM_HEAD_QUANT_NAME = "Q8_0"
 _PACKED_LM_HEAD_LOSS_NAME = "Packed DeepSeek Q8_0 LM-head loss"
+_PATCH_MARKER = "_patched_liger_loss"
 
 
 def deepseek_v4_liger_causal_lm_loss(
@@ -194,8 +195,8 @@ def apply_deepseek_v4_liger_loss(
             "DeepSeek V4 GGUF loss requires GgufLinear lm_head, got "
             f"{type(base.lm_head).__name__}."
         )
-    if getattr(base, "_deepseek_v4_liger_loss_enabled", False):
+    if getattr(base, _PATCH_MARKER, False):
         return base
     base.forward = MethodType(_deepseek_v4_liger_forward, base)
-    base.__dict__["_deepseek_v4_liger_loss_enabled"] = True
+    base.__dict__[_PATCH_MARKER] = True
     return base

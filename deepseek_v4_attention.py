@@ -1,5 +1,5 @@
 import math
-import types
+from collections.abc import Callable
 from typing import Any, cast
 
 import torch
@@ -17,6 +17,11 @@ from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
 from deepseek_v4_csa import deepseek_v4_csa_attention, deepseek_v4_csa_compress
 from deepseek_v4_hca import deepseek_v4_hca_attention, deepseek_v4_hca_compress
 from deepseek_v4_sliding_attention import deepseek_v4_sliding_attention
+from module_patching import (
+    ModulePatchSpec,
+    patch_module_forwards,
+    require_complete_inventory,
+)
 
 _ATTENTION_IMPLEMENTATION = "deepseek_v4_project"
 _SUPPORTED_BATCHES = frozenset({1, 4, 16})
@@ -31,10 +36,11 @@ _SOFTMAX_SCALE = 1.0 / math.sqrt(_HEAD_DIM)
 _EXPECTED_SLIDING = 2
 _EXPECTED_CSA = 21
 _EXPECTED_HCA = 20
-_CONFIG_MARKER = "_deepseek_v4_attention_configured"
-_CSA_CONFIG_MARKER = "_deepseek_v4_csa_configured"
-_HCA_CONFIG_MARKER = "_deepseek_v4_hca_configured"
-_MODEL_HOOK_MARKER = "_deepseek_v4_attention_input_hook"
+_SUBJECT = "DeepSeek V4 attention"
+_CONFIG_MARKER = "_patched_attention"
+_CSA_CONFIG_MARKER = "_patched_csa"
+_HCA_CONFIG_MARKER = "_patched_hca"
+_MODEL_HOOK_MARKER = "_patched_attention_input_hook"
 
 
 def _canonical_training_mask(
@@ -426,65 +432,64 @@ def _validate_config(config: DeepseekV4Config) -> None:
         raise RuntimeError(f"unsupported DeepSeek V4 attention config: {mismatches}")
 
 
-def configure_deepseek_v4_attention(model: torch.nn.Module) -> dict[str, Any]:
-    """Enable project attention dispatch on one already-loaded model instance."""
+_ATTENTION_FAMILIES = (
+    "sliding_attention",
+    "compressed_sparse_attention",
+    "heavily_compressed_attention",
+)
 
-    config = getattr(model, "config", None)
-    if not isinstance(config, DeepseekV4Config):
-        raise TypeError("configure_deepseek_v4_attention requires DeepseekV4Config")
-    _validate_config(config)
-    ALL_ATTENTION_FUNCTIONS.register(
-        _ATTENTION_IMPLEMENTATION, _deepseek_v4_attention_forward
-    )
-    ALL_MASK_ATTENTION_FUNCTIONS.register(
-        _ATTENTION_IMPLEMENTATION, _canonical_training_mask
-    )
 
-    counts = {
-        "sliding_attention": 0,
-        "compressed_sparse_attention": 0,
-        "heavily_compressed_attention": 0,
-    }
-    configured_names: list[str] = []
-    configured_csa_names: list[str] = []
-    configured_hca_names: list[str] = []
-    already_configured = 0
-    already_configured_csa = 0
-    already_configured_hca = 0
+def _validate_attention_families(model: torch.nn.Module) -> None:
+    """Reject a layer type that no spec owns before any module is patched."""
+
     for name, module in model.named_modules():
         if not isinstance(module, DeepseekV4Attention):
             continue
-        if module.layer_type not in counts:
+        if module.layer_type not in _ATTENTION_FAMILIES:
             raise RuntimeError(
-                f"unknown DeepSeek V4 attention family {module.layer_type!r}"
+                f"unknown DeepSeek V4 attention family {module.layer_type!r} at {name!r}"
             )
-        counts[module.layer_type] += 1
-        if module.layer_type == "sliding_attention":
-            if getattr(module, _CONFIG_MARKER, False):
-                already_configured += 1
-            else:
-                setattr(module, _CONFIG_MARKER, True)
-                configured_names.append(name)
-        elif module.layer_type == "compressed_sparse_attention":
-            if getattr(module, _CSA_CONFIG_MARKER, False):
-                already_configured_csa += 1
-            else:
-                setattr(module, _CSA_CONFIG_MARKER, True)
-                module.forward = types.MethodType(
-                    _deepseek_v4_csa_module_forward,
-                    module,
-                )
-                configured_csa_names.append(name)
-        elif module.layer_type == "heavily_compressed_attention":
-            if getattr(module, _HCA_CONFIG_MARKER, False):
-                already_configured_hca += 1
-            else:
-                setattr(module, _HCA_CONFIG_MARKER, True)
-                module.forward = types.MethodType(
-                    _deepseek_v4_hca_module_forward,
-                    module,
-                )
-                configured_hca_names.append(name)
+
+
+def _attention_spec(
+    family: str,
+    *,
+    forward: Callable[..., Any] | None,
+    marker: str,
+) -> ModulePatchSpec[DeepseekV4Attention]:
+    """Route one attention layer family to its forward, or mark it when dispatch owns it."""
+
+    def _matches(name: str, module: DeepseekV4Attention) -> bool:
+        del name
+        return module.layer_type == family
+
+    return ModulePatchSpec(
+        module_type=DeepseekV4Attention,
+        forward=forward,
+        handled_key=family,
+        matches=_matches,
+        marker=marker,
+        freeze_weight=False,
+    )
+
+
+_ATTENTION_SPECS = (
+    _attention_spec("sliding_attention", forward=None, marker=_CONFIG_MARKER),
+    _attention_spec(
+        "compressed_sparse_attention",
+        forward=_deepseek_v4_csa_module_forward,
+        marker=_CSA_CONFIG_MARKER,
+    ),
+    _attention_spec(
+        "heavily_compressed_attention",
+        forward=_deepseek_v4_hca_module_forward,
+        marker=_HCA_CONFIG_MARKER,
+    ),
+)
+
+
+def _hook_attention_inputs(model: torch.nn.Module) -> int:
+    """Attach the shared input validator to every model shell that lacks it."""
 
     hooked_models = 0
     for module in model.modules():
@@ -496,66 +501,45 @@ def configure_deepseek_v4_attention(model: torch.nn.Module) -> dict[str, Any]:
                 _validate_model_inputs, with_kwargs=True
             )
             setattr(module, _MODEL_HOOK_MARKER, handle)
+    return hooked_models
 
-    config._attn_implementation = _ATTENTION_IMPLEMENTATION
-    return {
-        **counts,
-        "configured_sliding": len(configured_names),
-        "already_configured": already_configured,
-        "configured_csa": len(configured_csa_names),
-        "already_configured_csa": already_configured_csa,
-        "configured_hca": len(configured_hca_names),
-        "already_configured_hca": already_configured_hca,
-        "hooked_models": hooked_models,
-        "implementation": _ATTENTION_IMPLEMENTATION,
-        "configured_names": configured_names,
-        "configured_csa_names": configured_csa_names,
-        "configured_hca_names": configured_hca_names,
+
+def configure_deepseek_v4_attention(model: torch.nn.Module) -> dict[str, Any]:
+    """Enable project attention dispatch on one already-loaded model instance."""
+
+    config = getattr(model, "config", None)
+    if not isinstance(config, DeepseekV4Config):
+        raise TypeError("configure_deepseek_v4_attention requires DeepseekV4Config")
+    _validate_config(config)
+    _validate_attention_families(model)
+    ALL_ATTENTION_FUNCTIONS.register(
+        _ATTENTION_IMPLEMENTATION, _deepseek_v4_attention_forward
+    )
+    ALL_MASK_ATTENTION_FUNCTIONS.register(
+        _ATTENTION_IMPLEMENTATION, _canonical_training_mask
+    )
+
+    report = patch_module_forwards(model, _ATTENTION_SPECS)
+    report["paths"] = {
+        key: sorted(names) for key, names in report["handled_by_key"].items()
     }
+    report["hooked_models"] = _hook_attention_inputs(model)
+    report["implementation"] = _ATTENTION_IMPLEMENTATION
+    config._attn_implementation = _ATTENTION_IMPLEMENTATION
+    return report
 
 
 def require_complete_deepseek_v4_attention(report: dict[str, Any]) -> None:
-    expected = {
-        "sliding_attention": _EXPECTED_SLIDING,
-        "compressed_sparse_attention": _EXPECTED_CSA,
-        "heavily_compressed_attention": _EXPECTED_HCA,
-        "hooked_models": 1,
-    }
-    mismatches: dict[str, tuple[Any, Any]] = {
-        name: (value, report.get(name))
-        for name, value in expected.items()
-        if report.get(name) != value
-    }
-    if (
-        report.get("configured_sliding", 0) + report.get("already_configured", 0)
-        != _EXPECTED_SLIDING
-    ):
-        mismatches["configured_sliding"] = (
-            _EXPECTED_SLIDING,
-            report.get("configured_sliding", 0) + report.get("already_configured", 0),
-        )
-    if (
-        report.get("configured_csa", 0) + report.get("already_configured_csa", 0)
-        != _EXPECTED_CSA
-    ):
-        mismatches["configured_csa"] = (
-            _EXPECTED_CSA,
-            report.get("configured_csa", 0) + report.get("already_configured_csa", 0),
-        )
-    if (
-        report.get("configured_hca", 0) + report.get("already_configured_hca", 0)
-        != _EXPECTED_HCA
-    ):
-        mismatches["configured_hca"] = (
-            _EXPECTED_HCA,
-            report.get("configured_hca", 0) + report.get("already_configured_hca", 0),
-        )
-    if report.get("implementation") != _ATTENTION_IMPLEMENTATION:
-        mismatches["implementation"] = (
-            _ATTENTION_IMPLEMENTATION,
-            report.get("implementation"),
-        )
-    if mismatches:
-        raise RuntimeError(
-            f"incomplete DeepSeek V4 attention configuration: {mismatches}"
-        )
+    """Fail closed unless every fixed DeepSeek V4 attention site was configured."""
+
+    require_complete_inventory(
+        report,
+        {
+            "sliding_attention": _EXPECTED_SLIDING,
+            "compressed_sparse_attention": _EXPECTED_CSA,
+            "heavily_compressed_attention": _EXPECTED_HCA,
+            "hooked_models": 1,
+            "implementation": _ATTENTION_IMPLEMENTATION,
+        },
+        subject=_SUBJECT,
+    )

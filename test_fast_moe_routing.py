@@ -11,17 +11,12 @@ from fast_moe_routing import (
     finalize_expert_routing,
     prepare_expert_routing,
 )
+from test_support import assert_relative_rmse, require_grad
 
 _TOKENS = 2048
 _TOP_K = 8
 _HIDDEN = 2048
 _ROUTES = _TOKENS * _TOP_K
-
-
-def _require_grad(tensor: torch.Tensor) -> torch.Tensor:
-    if tensor.grad is None:
-        raise AssertionError("expected a tensor gradient")
-    return tensor.grad
 
 
 class _RecordOps(TorchDispatchMode):
@@ -48,19 +43,6 @@ def _assert_reasonable_routing_gradient(
     assert float(cosine) > 0.99999
 
 
-def _assert_relative_rmse(
-    actual: torch.Tensor,
-    reference: torch.Tensor,
-    maximum: float,
-) -> None:
-    actual_float = actual.detach().double().reshape(-1)
-    reference_float = reference.detach().double().reshape(-1)
-    delta_rmse = (actual_float - reference_float).square().mean().sqrt()
-    reference_rms = reference_float.square().mean().sqrt().clamp_min(1e-12)
-    relative_rmse = float(delta_rmse / reference_rms)
-    assert relative_rmse <= maximum, (relative_rmse, maximum)
-
-
 def _assert_bf16_accumulation_close(
     actual: torch.Tensor,
     reference: torch.Tensor,
@@ -75,7 +57,7 @@ def _assert_bf16_accumulation_close(
     (order 1) cannot.
     """
 
-    _assert_relative_rmse(actual, reference, 1e-2)
+    assert_relative_rmse(actual, reference, 1e-2)
     cosine = torch.nn.functional.cosine_similarity(
         actual.detach().double().reshape(-1),
         reference.detach().double().reshape(-1),
@@ -200,7 +182,7 @@ def test_route_gather_matches_reference_and_has_no_index_put() -> None:
     reference_selected.backward(grad_selected)
 
     _assert_bf16_accumulation_close(
-        _require_grad(hidden), _require_grad(reference_hidden)
+        require_grad(hidden), require_grad(reference_hidden)
     )
     assert not any("_index_put_impl_" in operation for operation in dispatched_ops)
 
@@ -263,7 +245,7 @@ def test_route_combine_forward_and_backward_match_reference(
     exact.index_add_(0, permutation // _TOP_K, ordered)
     # Quantize the reference the same way the kernel stores, so this gate isolates
     # the accumulation precision (measured 1.3e-5) rather than the shared BF16 store.
-    _assert_relative_rmse(actual, exact.to(output.dtype), 1e-4)
+    assert_relative_rmse(actual, exact.to(output.dtype), 1e-4)
 
     grad_final = torch.randn(
         (_TOKENS, _HIDDEN),
@@ -277,10 +259,10 @@ def test_route_combine_forward_and_backward_match_reference(
     expected.backward(grad_final)
 
     torch.testing.assert_close(
-        _require_grad(output), _require_grad(reference_output), rtol=0, atol=0
+        require_grad(output), require_grad(reference_output), rtol=0, atol=0
     )
     _assert_reasonable_routing_gradient(
-        _require_grad(routing_weights), _require_grad(reference_weights)
+        require_grad(routing_weights), require_grad(reference_weights)
     )
     assert not any("_index_put_impl_" in operation for operation in dispatched_ops)
 
@@ -362,13 +344,13 @@ def test_noncanonical_token_count_matches_reference(
     )
 
     _assert_bf16_accumulation_close(
-        _require_grad(hidden), _require_grad(reference_hidden)
+        require_grad(hidden), require_grad(reference_hidden)
     )
     torch.testing.assert_close(
-        _require_grad(output), _require_grad(reference_output), rtol=0, atol=0
+        require_grad(output), require_grad(reference_output), rtol=0, atol=0
     )
     _assert_reasonable_routing_gradient(
-        _require_grad(routing_weights), _require_grad(reference_weights)
+        require_grad(routing_weights), require_grad(reference_weights)
     )
 
 

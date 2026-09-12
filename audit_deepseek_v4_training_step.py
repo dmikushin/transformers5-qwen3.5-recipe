@@ -39,6 +39,7 @@ from deepseek_v4_lora import (
     audit_deepseek_v4_injection,
     configure_deepseek_v4_grouped_mmq,
     register_deepseek_v4_lora,
+    require_complete_deepseek_v4_grouped_mmq,
 )
 from deepseek_v4_moe_lora import DeepseekV4GgufMoeLora, register_deepseek_v4_moe_lora
 from deepseek_v4_profiler import profile_warmed_training_update
@@ -264,11 +265,7 @@ def main() -> None:
     require_complete_deepseek_v4_attention(report["attention"])
     report["router"] = configure_fast_moe_ranking(model)
     report["grouped_mmq"] = configure_deepseek_v4_grouped_mmq(model)
-    if report["grouped_mmq"]["enabled"] != 43:
-        raise RuntimeError(
-            "expected 43 native DeepSeek grouped output-A projections, found "
-            f"{report['grouped_mmq']['enabled']}"
-        )
+    require_complete_deepseek_v4_grouped_mmq(report["grouped_mmq"])
     report["liger_rmsnorm"] = configure_deepseek_v4_liger_rmsnorm(model)
     require_complete_deepseek_v4_liger_rmsnorm(report["liger_rmsnorm"])
     report["liger_mhc"] = configure_deepseek_v4_liger_mhc(model)

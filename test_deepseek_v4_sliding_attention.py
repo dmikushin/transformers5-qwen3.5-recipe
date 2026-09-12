@@ -432,12 +432,15 @@ def test_attention_configuration_is_complete_and_idempotent() -> None:
     second = configure_deepseek_v4_attention(model)
     require_complete_deepseek_v4_attention(second)
 
-    assert first["configured_sliding"] == 2
-    assert first["already_configured"] == 0
-    assert first["configured_csa"] == 21
-    assert first["already_configured_csa"] == 0
-    assert second["configured_sliding"] == 0
-    assert second["already_configured"] == 2
-    assert second["configured_csa"] == 0
-    assert second["already_configured_csa"] == 21
+    assert first["sliding_attention"] == 2
+    assert first["compressed_sparse_attention"] == 21
+    assert first["heavily_compressed_attention"] == 20
+    assert first["patched"] == 43
+    assert first["already_patched"] == 0
+    assert second["sliding_attention"] == 2
+    assert second["compressed_sparse_attention"] == 21
+    assert second["heavily_compressed_attention"] == 20
+    assert second["patched"] == 0
+    assert second["already_patched"] == 43
+    assert second["hooked_models"] == 1
     assert config._attn_implementation == "deepseek_v4_project"
