@@ -17,14 +17,14 @@ from transformers.integrations.gguf.moe import ALL_GGUF_EXPERTS_FUNCTIONS, GgufE
 
 import fast_moe_lora
 from fast_moe_lora import (
-    EXPERTS_IMPLEMENTATION,
+    QWEN3_5_MOE_EXPERTS_IMPLEMENTATION,
     FastGgufMoeLora,
     _aiter_input_grad,
     _base_grouped_linear,
     _base_grouped_pair,
     _prepare_packed_expert_execution,
     aiter_grouped_mm,
-    qwen3_5_moe_gguf_mmq_aiter_lora_forward,
+    gguf_mmq_aiter_lora_forward,
 )
 from gguf_support import dequantize_gguf_tensor
 
@@ -699,7 +699,7 @@ def test_one_expert_layer_has_finite_lora_gradients_and_no_packed_gradients(
         hidden_size=2048,
         moe_intermediate_size=512,
         hidden_act="silu",
-        _experts_implementation=EXPERTS_IMPLEMENTATION,
+        _experts_implementation=QWEN3_5_MOE_EXPERTS_IMPLEMENTATION,
     )
     experts = GgufExperts(config, device="meta", compute_dtype=torch.bfloat16)
     experts.config = config
@@ -712,8 +712,8 @@ def test_one_expert_layer_has_finite_lora_gradients_and_no_packed_gradients(
     experts.down_proj = _packed_projection(
         reader, "down", num_experts=256, out_features=2048
     )
-    ALL_GGUF_EXPERTS_FUNCTIONS[EXPERTS_IMPLEMENTATION] = (
-        qwen3_5_moe_gguf_mmq_aiter_lora_forward
+    ALL_GGUF_EXPERTS_FUNCTIONS[QWEN3_5_MOE_EXPERTS_IMPLEMENTATION] = (
+        gguf_mmq_aiter_lora_forward
     )
 
     lora_config = LoraConfig(

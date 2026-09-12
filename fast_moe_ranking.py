@@ -479,8 +479,7 @@ def _qwen_router_forward(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     flat = hidden_states.reshape(-1, self.hidden_dim)
     # BF16 GEMM (FP32 accumulation) rounded to BF16 at the projection, then
-    # upcast so the score function, FP32 correction bias, selection, and
-    # normalization below stay in FP32.
+    # upcast so the top-k selection and softmax below stay in FP32.
     router_logits = F.linear(flat, self.weight).to(torch.float32)
     router_indices = router_topk_indices(router_logits, self.top_k)
     selected_logits = router_logits.gather(1, router_indices)

@@ -9,13 +9,13 @@ from transformers.integrations.gguf.moe import (
 
 from deepseek_v4_lora import DEEPSEEK_V4_TARGET_MODULES_PATTERN
 from fast_moe_lora import (
+    _LORA_WEIGHTS_KWARG,
     FastGgufMoeLora,
     _ExpertLoraWeights,
-    qwen3_5_moe_gguf_mmq_aiter_lora_forward,
+    gguf_mmq_aiter_lora_forward,
 )
 
-EXPERTS_IMPLEMENTATION = "deepseek_v4_gguf_mmq_aiter_lora"
-_LORA_WEIGHTS_KWARG = "_deepseek_v4_gguf_lora_weights"
+DEEPSEEK_V4_EXPERTS_IMPLEMENTATION = "deepseek_v4_gguf_mmq_aiter_lora"
 
 
 def _bind_deepseek_expert_priors(
@@ -78,9 +78,10 @@ class DeepseekV4GgufMoeLora(FastGgufMoeLora):
                 "DeepSeek V4 expert LoRA requires DeepseekV4GgufExperts, got "
                 f"{type(experts).__name__}."
             )
-        if experts.config._experts_implementation != EXPERTS_IMPLEMENTATION:
+        if experts.config._experts_implementation != DEEPSEEK_V4_EXPERTS_IMPLEMENTATION:
             raise RuntimeError(
-                f"DeepSeek V4 expert LoRA requires experts_implementation={EXPERTS_IMPLEMENTATION!r}, "
+                f"DeepSeek V4 expert LoRA requires experts_implementation="
+                f"{DEEPSEEK_V4_EXPERTS_IMPLEMENTATION!r}, "
                 f"got {experts.config._experts_implementation!r}."
             )
         kwargs[_LORA_WEIGHTS_KWARG] = lora_weights
@@ -92,20 +93,21 @@ def deepseek_v4_gguf_mmq_aiter_lora_forward(
     hidden_states: torch.Tensor,
     top_k_index: torch.Tensor,
     top_k_weights: torch.Tensor,
-    _deepseek_v4_gguf_lora_weights: _ExpertLoraWeights | None = None,
+    _gguf_moe_lora_weights: _ExpertLoraWeights | None = None,
 ) -> torch.Tensor:
     """Run packed GGTensile base MMQ and AITER LoRA grouped MM."""
 
     if not isinstance(self, DeepseekV4GgufExperts):
         raise TypeError(
-            f"{EXPERTS_IMPLEMENTATION} requires DeepseekV4GgufExperts, got {type(self).__name__}."
+            f"{DEEPSEEK_V4_EXPERTS_IMPLEMENTATION} requires DeepseekV4GgufExperts, "
+            f"got {type(self).__name__}."
         )
-    return qwen3_5_moe_gguf_mmq_aiter_lora_forward(
+    return gguf_mmq_aiter_lora_forward(
         self,
         hidden_states,
         top_k_index,
         top_k_weights,
-        _qwen3_5_moe_gguf_lora_weights=_deepseek_v4_gguf_lora_weights,
+        _gguf_moe_lora_weights=_gguf_moe_lora_weights,
     )
 
 
@@ -140,10 +142,10 @@ def register_deepseek_v4_moe_lora(
         target_modules = set(lora_config.target_modules or ())
         target_modules.add("experts")
         lora_config.__dict__["target_modules"] = target_modules
-    ALL_GGUF_EXPERTS_FUNCTIONS[EXPERTS_IMPLEMENTATION] = (
+    ALL_GGUF_EXPERTS_FUNCTIONS[DEEPSEEK_V4_EXPERTS_IMPLEMENTATION] = (
         deepseek_v4_gguf_mmq_aiter_lora_forward
     )
-    cast(Any, model).set_experts_implementation(EXPERTS_IMPLEMENTATION)
+    cast(Any, model).set_experts_implementation(DEEPSEEK_V4_EXPERTS_IMPLEMENTATION)
     lora_config.__dict__["_aiter_expert_prior_counts"] = _bind_deepseek_expert_priors(
         model, expert_prior
     )

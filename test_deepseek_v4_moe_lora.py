@@ -19,7 +19,7 @@ from transformers.integrations.gguf.moe import (
 
 import fast_moe_lora
 from deepseek_v4_moe_lora import (
-    EXPERTS_IMPLEMENTATION,
+    DEEPSEEK_V4_EXPERTS_IMPLEMENTATION,
     DeepseekV4GgufMoeLora,
     _bind_deepseek_expert_priors,
     deepseek_v4_gguf_mmq_aiter_lora_forward,
@@ -254,7 +254,7 @@ def test_complete_deepseek_expert_lora_preserves_clamp_and_has_finite_gradients(
         moe_intermediate_size=2048,
         hidden_act="silu",
         swiglu_limit=0.05,
-        _experts_implementation=EXPERTS_IMPLEMENTATION,
+        _experts_implementation=DEEPSEEK_V4_EXPERTS_IMPLEMENTATION,
     )
     experts = DeepseekV4GgufExperts(
         config,
@@ -265,7 +265,7 @@ def test_complete_deepseek_expert_lora_preserves_clamp_and_has_finite_gradients(
     experts.gate_proj = _packed_experts(reader, "gate")
     experts.up_proj = _packed_experts(reader, "up")
     experts.down_proj = _packed_experts(reader, "down")
-    ALL_GGUF_EXPERTS_FUNCTIONS[EXPERTS_IMPLEMENTATION] = (
+    ALL_GGUF_EXPERTS_FUNCTIONS[DEEPSEEK_V4_EXPERTS_IMPLEMENTATION] = (
         deepseek_v4_gguf_mmq_aiter_lora_forward
     )
 

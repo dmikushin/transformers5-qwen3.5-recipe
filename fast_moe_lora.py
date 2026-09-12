@@ -1,4 +1,8 @@
-"""Fast persistent-GGUF Qwen3.5-MoE LoRA using packed MMQ and AITER.
+"""Fast persistent-GGUF MoE LoRA with packed MMQ and AITER.
+
+The backend is shared by Qwen3.5-MoE and DeepSeek V4. Model-specific behavior
+stays in the owning experts class (``_prepare_expert_hidden_states`` and
+``_apply_split_gate``) and in each model's wrapper/registration module.
 
 Packed expert forward projections run directly through grouped gfx1151 MMQ.
 Gate and up share one dynamic Q8_1 activation workspace. Frozen base input
@@ -12,7 +16,7 @@ gradient is constructed.
 
 PEFT targets each complete ``GgufExperts`` module rather than its packed
 physical parameters. One wrapper owns the combined gate/up and down factors,
-which keeps the Qwen3.5 shared-A gate/up LoRA semantics while avoiding nested
+which keeps the combined gate/up LoRA semantics while avoiding nested
 parameter wrappers and transient state on the expert module.
 """
 
@@ -34,8 +38,8 @@ from fast_moe_routing import finalize_expert_routing, prepare_expert_routing
 from moe_gmm_configs import gmm_config as _gmm_config
 from moe_gmm_configs import ptgmm_config as _ptgmm_config
 
-EXPERTS_IMPLEMENTATION = "qwen3_5_moe_gguf_mmq_aiter_lora"
-_LORA_WEIGHTS_KWARG = "_qwen3_5_moe_gguf_lora_weights"
+QWEN3_5_MOE_EXPERTS_IMPLEMENTATION = "qwen3_5_moe_gguf_mmq_aiter_lora"
+_LORA_WEIGHTS_KWARG = "_gguf_moe_lora_weights"
 _GGUF_EXPERTS_TYPE = cast(type[Any], GgufExperts)
 
 
@@ -571,9 +575,10 @@ class FastGgufMoeLora(torch.nn.Module, LoraLayer):
         adapter_names = kwargs.pop("adapter_names", None)
         lora_weights = self._active_lora_weights(adapter_names)
         experts = cast(Any, self.get_base_layer())
-        if experts.config._experts_implementation != EXPERTS_IMPLEMENTATION:
+        if experts.config._experts_implementation != QWEN3_5_MOE_EXPERTS_IMPLEMENTATION:
             raise RuntimeError(
-                f"Fast GGUF MoE LoRA requires experts_implementation={EXPERTS_IMPLEMENTATION!r}, "
+                f"Fast GGUF MoE LoRA requires experts_implementation="
+                f"{QWEN3_5_MOE_EXPERTS_IMPLEMENTATION!r}, "
                 f"got {experts.config._experts_implementation!r}."
             )
         kwargs[_LORA_WEIGHTS_KWARG] = lora_weights
@@ -618,18 +623,18 @@ def _lora_grouped_linear(
     )
 
 
-def qwen3_5_moe_gguf_mmq_aiter_lora_forward(
+def gguf_mmq_aiter_lora_forward(
     self: Any,
     hidden_states: torch.Tensor,
     top_k_index: torch.Tensor,
     top_k_weights: torch.Tensor,
-    _qwen3_5_moe_gguf_lora_weights: _ExpertLoraWeights | None = None,
+    _gguf_moe_lora_weights: _ExpertLoraWeights | None = None,
 ) -> torch.Tensor:
     """Persistent packed GGUF base projections with separated AITER LoRA GEMMs."""
 
     if not isinstance(self, _GGUF_EXPERTS_TYPE):
         raise TypeError(
-            f"{EXPERTS_IMPLEMENTATION} requires GgufExperts, got {type(self).__name__}."
+            f"Packed GGUF MoE LoRA requires GgufExperts, got {type(self).__name__}."
         )
     if self.projection_layout != "split_gate_up" or self.has_bias or not self.has_gate:
         raise RuntimeError(
@@ -664,7 +669,7 @@ def qwen3_5_moe_gguf_mmq_aiter_lora_forward(
         self.compute_dtype,
     )
 
-    lora_weights = _qwen3_5_moe_gguf_lora_weights
+    lora_weights = _gguf_moe_lora_weights
     if lora_weights is not None:
         # `group_sizes` already covers every expert, so the grouped MM skips the
         # empty groups without selecting or gathering expert factors.
@@ -736,10 +741,10 @@ def register_fast_moe_lora(
     target_modules.add("experts")
     lora_config.__dict__["target_modules"] = target_modules
 
-    ALL_GGUF_EXPERTS_FUNCTIONS[EXPERTS_IMPLEMENTATION] = (
-        qwen3_5_moe_gguf_mmq_aiter_lora_forward
+    ALL_GGUF_EXPERTS_FUNCTIONS[QWEN3_5_MOE_EXPERTS_IMPLEMENTATION] = (
+        gguf_mmq_aiter_lora_forward
     )
-    cast(Any, model).set_experts_implementation(EXPERTS_IMPLEMENTATION)
+    cast(Any, model).set_experts_implementation(QWEN3_5_MOE_EXPERTS_IMPLEMENTATION)
     for module in model.modules():
         if isinstance(module, _GGUF_EXPERTS_TYPE):
             module.__dict__["_aiter_expert_prior"] = expert_prior
