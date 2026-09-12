@@ -29,6 +29,10 @@ from fast_moe_ranking import configure_fast_moe_ranking
 from fla_tuning import configure_qwen35_fla
 from gguf_dequant_compile import configure_compiled_gguf_dequantize
 from gguf_liger_loss import apply_gguf_liger_fused_linear_cross_entropy
+from qwen3_5_fused_norms import (
+    configure_qwen35_fused_norms,
+    require_complete_qwen35_fused_norms,
+)
 from qwen3_5_profiler import profile_warmed_training_update
 from training_audit import (
     audit_optimizer,
@@ -310,6 +314,8 @@ def main() -> None:
     model.config.output_router_logits = False
     model.config.router_aux_loss_coef = 0.0
     report["router"] = configure_fast_moe_ranking(model)
+    report["fused_norms"] = configure_qwen35_fused_norms(model)
+    require_complete_qwen35_fused_norms(report["fused_norms"])
     report["load_audit"] = audit_loaded_model(model, loading_info)
     report["memory_after_load"] = memory_snapshot()
     persist()

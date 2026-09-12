@@ -27,6 +27,7 @@ from fast_moe_ranking import configure_fast_moe_ranking
 from fla_tuning import configure_qwen35_fla
 from gguf_dequant_compile import configure_compiled_gguf_dequantize
 from gguf_liger_loss import apply_gguf_liger_fused_linear_cross_entropy
+from qwen3_5_fused_norms import configure_qwen35_fused_norms
 
 script_dir = Path(__file__).resolve().parent
 
@@ -87,6 +88,7 @@ def main():
     model.config.router_aux_loss_coef = 0.0
 
     configure_fast_moe_ranking(model)
+    configure_qwen35_fused_norms(model)
 
     lora_config = LoraConfig(
         task_type=TaskType.CAUSAL_LM,
@@ -143,14 +145,6 @@ def main():
         save_total_limit=5,
         bf16=True,
         optim="adamw_8bit",
-        use_liger_kernel=True,
-        liger_kernel_config={
-            "rope": False,  # Liger's Qwen3 RoPE patch is wrong on Qwen3.5
-            "cross_entropy": False,
-            "fused_linear_cross_entropy": False,  # We use our cross entropy patch
-            "rms_norm": True,
-            "swiglu": False,  # Liger's MoE SwiGLU patch is incompatible with our MoE LoRA patch
-        },
         gradient_checkpointing=True,
         gradient_checkpointing_kwargs={"use_reentrant": False},
         remove_unused_columns=False,

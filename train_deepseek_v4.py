@@ -129,7 +129,6 @@ def main():
         save_total_limit=5,
         bf16=True,
         optim="adamw_8bit",
-        use_liger_kernel=False,
         gradient_checkpointing=True,
         gradient_checkpointing_kwargs={"use_reentrant": False},
         remove_unused_columns=False,
