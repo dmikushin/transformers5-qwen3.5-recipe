@@ -9,9 +9,12 @@ The optimized training workloads are sequence length 2,048 at physical batches
   256 experts, top-6 sqrt-softplus-plus-correction-bias selection, and
   12,288/49,152/196,608 routed rows.
 * DeepSeek V4 hash routers have the same hidden/expert geometry and top-6
-  weights, but their expert IDs come from the fixed token lookup table.
+  weights, but their expert IDs come from the fixed token lookup table. Because
+  the lookup fixes the six experts before any projection, their logits are
+  projected directly from the selected gate rows instead of a 256-expert
+  projection. No full-width score tensor is materialized.
 
-The linear projection is a normal BF16 ``F.linear`` (FP32 internal
+The learned-router projection is a normal BF16 ``F.linear`` (FP32 internal
 accumulation) whose BF16 result is upcast to FP32 so the scoring path stays in
 FP32. The Triton kernel replaces full-width softmax/sqrt-softplus plus
 ``torch.topk`` with one 256-expert streaming selection. Normalization is then
@@ -272,6 +275,204 @@ def router_topk_indices(
     return indices
 
 
+# Fixed DeepSeek V4 hash-router geometry. The token lookup fixes the six
+# experts before any projection, so one program per token streams the token row
+# once and reads the six selected rows of the L2-resident gate table. This
+# replaces a 256-expert projection whose other 250 columns were discarded.
+_HASH_BLOCK_K = 1024
+_HASH_BLOCK_D = 2048
+_HASH_FORWARD_WARPS = 4
+_HASH_BACKWARD_WARPS = 2
+
+
+@triton.jit
+def _hash_router_logits_forward_kernel(
+    hidden_ptr,
+    weight_ptr,
+    indices_ptr,
+    logits_ptr,
+    HIDDEN: tl.constexpr,
+    TOP_K: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    token = tl.program_id(0)
+    rank_offsets = tl.arange(0, _TRITON_TOP_K_PAD)
+    rank_mask = rank_offsets < TOP_K
+    expert_ids = tl.load(
+        indices_ptr + token * TOP_K + rank_offsets,
+        mask=rank_mask,
+        other=0,
+    ).to(tl.int64)
+    projected = tl.zeros((_TRITON_TOP_K_PAD,), tl.float32)
+    hidden_base = hidden_ptr + token * HIDDEN
+    for k_start in tl.range(0, HIDDEN, BLOCK_K, loop_unroll_factor=1):
+        k_offsets = k_start + tl.arange(0, BLOCK_K)
+        k_mask = k_offsets < HIDDEN
+        x = tl.load(hidden_base + k_offsets, mask=k_mask, other=0.0).to(tl.float32)
+        weight = tl.load(
+            weight_ptr + expert_ids[:, None] * HIDDEN + k_offsets[None, :],
+            mask=rank_mask[:, None] & k_mask[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        projected += tl.sum(weight * x[None, :], axis=1)
+    tl.store(logits_ptr + token * TOP_K + rank_offsets, projected, mask=rank_mask)
+
+
+@triton.jit
+def _hash_router_input_grad_kernel(
+    grad_logits_ptr,
+    weight_ptr,
+    indices_ptr,
+    grad_hidden_ptr,
+    HIDDEN: tl.constexpr,
+    TOP_K: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    token = tl.program_id(0)
+    rank_offsets = tl.arange(0, _TRITON_TOP_K_PAD)
+    rank_mask = rank_offsets < TOP_K
+    expert_ids = tl.load(
+        indices_ptr + token * TOP_K + rank_offsets,
+        mask=rank_mask,
+        other=0,
+    ).to(tl.int64)
+    grads = tl.load(
+        grad_logits_ptr + token * TOP_K + rank_offsets,
+        mask=rank_mask,
+        other=0.0,
+    ).to(tl.float32)
+    grad_base = grad_hidden_ptr + token * HIDDEN
+    for d_start in tl.range(0, HIDDEN, BLOCK_D, loop_unroll_factor=1):
+        d_offsets = d_start + tl.arange(0, BLOCK_D)
+        d_mask = d_offsets < HIDDEN
+        weight = tl.load(
+            weight_ptr + expert_ids[:, None] * HIDDEN + d_offsets[None, :],
+            mask=rank_mask[:, None] & d_mask[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        accumulated = tl.sum(weight * grads[:, None], axis=0)
+        tl.store(grad_base + d_offsets, accumulated, mask=d_mask)
+
+
+class _DeepseekHashRouterLogits(torch.autograd.Function):
+    """Six hash-selected expert logits for the fixed DeepSeek V4 geometry.
+
+    The token lookup fixes the selected experts, so only their dot products are
+    evaluated. Backward accumulates ``grad_logits[k] * weight[expert_k]`` in
+    FP32 and rounds once to the BF16 activation boundary. The frozen gate table
+    needs no gradient.
+    """
+
+    @staticmethod
+    def forward(
+        ctx: Any,
+        hidden_states: torch.Tensor,
+        weight: torch.Tensor,
+        indices: torch.Tensor,
+    ) -> torch.Tensor:
+        num_tokens, hidden_dim = hidden_states.shape
+        logits = torch.empty(
+            (num_tokens, _DEEPSEEK_TOP_K),
+            dtype=torch.float32,
+            device=hidden_states.device,
+        )
+        _hash_router_logits_forward_kernel[(num_tokens,)](
+            hidden_states,
+            weight,
+            indices,
+            logits,
+            HIDDEN=hidden_dim,
+            TOP_K=_DEEPSEEK_TOP_K,
+            BLOCK_K=_HASH_BLOCK_K,
+            num_warps=_HASH_FORWARD_WARPS,
+        )
+        ctx.save_for_backward(weight, indices)
+        ctx.hidden_meta = (hidden_states.shape, hidden_states.dtype)
+        return logits
+
+    @staticmethod
+    def backward(  # ty: ignore[invalid-method-override]
+        ctx: Any,
+        grad_logits: torch.Tensor,
+    ) -> tuple[torch.Tensor | None, None, None]:
+        weight, indices = ctx.saved_tensors
+        grad_hidden = None
+        if ctx.needs_input_grad[0]:
+            hidden_shape, hidden_dtype = ctx.hidden_meta
+            grad_logits = grad_logits.contiguous()
+            grad_hidden = torch.empty(
+                hidden_shape,
+                dtype=hidden_dtype,
+                device=grad_logits.device,
+            )
+            _hash_router_input_grad_kernel[(hidden_shape[0],)](
+                grad_logits,
+                weight,
+                indices,
+                grad_hidden,
+                HIDDEN=hidden_shape[1],
+                TOP_K=_DEEPSEEK_TOP_K,
+                BLOCK_D=_HASH_BLOCK_D,
+                num_warps=_HASH_BACKWARD_WARPS,
+            )
+        return grad_hidden, None, None
+
+
+def hash_router_selected_logits(
+    hidden_states: torch.Tensor,
+    weight: torch.Tensor,
+    indices: torch.Tensor,
+) -> torch.Tensor:
+    """Return the six hash-selected expert logits as FP32 ``[tokens,6]``."""
+
+    if hidden_states.ndim != 2 or weight.ndim != 2 or indices.ndim != 2:
+        raise ValueError(
+            "Hash-router logits require two-dimensional hidden states, weight, and indices."
+        )
+    num_tokens, hidden_dim = hidden_states.shape
+    if hidden_dim != _DEEPSEEK_HIDDEN_SIZE:
+        raise ValueError(
+            f"Hash-router logits require hidden size {_DEEPSEEK_HIDDEN_SIZE}, got {hidden_dim}."
+        )
+    if tuple(weight.shape) != (_NUM_EXPERTS, _DEEPSEEK_HIDDEN_SIZE):
+        raise ValueError(
+            f"Hash-router gate weight must have shape {(_NUM_EXPERTS, _DEEPSEEK_HIDDEN_SIZE)}, "
+            f"got {tuple(weight.shape)}."
+        )
+    if tuple(indices.shape) != (num_tokens, _DEEPSEEK_TOP_K):
+        raise ValueError(
+            f"Hash-router indices must have shape {(num_tokens, _DEEPSEEK_TOP_K)}, "
+            f"got {tuple(indices.shape)}."
+        )
+    if hidden_states.dtype != torch.bfloat16 or weight.dtype != torch.bfloat16:
+        raise TypeError(
+            "Hash-router logits require BF16 hidden states and gate weights."
+        )
+    if indices.dtype not in (torch.int32, torch.int64):
+        raise TypeError(
+            f"Hash-router indices must use int32 or int64, got {indices.dtype}."
+        )
+    if weight.requires_grad:
+        raise RuntimeError("Hash-router gate weights must remain frozen.")
+    if hidden_states.device.type != "cuda":
+        raise RuntimeError("Hash-router logits require CUDA/ROCm tensors.")
+    if any(tensor.device != hidden_states.device for tensor in (weight, indices)):
+        raise ValueError("Hash-router logits require all tensors on one device.")
+    if (
+        not hidden_states.is_contiguous()
+        or not weight.is_contiguous()
+        or not indices.is_contiguous()
+    ):
+        raise ValueError("Hash-router logits require contiguous inputs.")
+    if num_tokens == 0:
+        return torch.empty(
+            (0, _DEEPSEEK_TOP_K),
+            dtype=torch.float32,
+            device=hidden_states.device,
+        )
+    return _DeepseekHashRouterLogits.apply(hidden_states, weight, indices)
+
+
 def _qwen_router_forward(
     self: Qwen3_5MoeTopKRouter,
     hidden_states: torch.Tensor,
@@ -312,11 +513,14 @@ def _deepseek_hash_router_forward(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     self = cast(Any, self)
     flat = hidden_states.reshape(-1, self.hidden_dim)
-    logits = F.linear(flat, self.weight).to(torch.float32)
     indices = self.tid2eid[input_ids.reshape(-1)].long()
-    scores = self.score_fn(logits.gather(1, indices))
+    # The token lookup fixes the experts, so only the six selected logits are
+    # projected. Returning the selected logits (not a 256-wide tensor) keeps the
+    # scoring path in FP32 without materializing the other 250 expert columns.
+    selected_logits = hash_router_selected_logits(flat, self.weight, indices)
+    scores = self.score_fn(selected_logits)
     weights = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20)
-    return logits, weights * self.routed_scaling_factor, indices
+    return selected_logits, weights * self.routed_scaling_factor, indices
 
 
 def _bind_router_expert_prior(

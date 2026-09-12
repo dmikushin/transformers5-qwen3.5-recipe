@@ -4,6 +4,7 @@ from typing import Any, cast
 
 import pytest
 import torch
+from torch.utils._python_dispatch import TorchDispatchMode
 from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
     DeepseekV4HashRouter,
     DeepseekV4TopKRouter,
@@ -127,6 +128,16 @@ def _assert_relative_rmse(
     reference_rms = reference_float.square().mean().sqrt().clamp_min(1e-12)
     relative_rmse = float(delta_rmse / reference_rms)
     assert relative_rmse <= maximum, (relative_rmse, maximum)
+
+
+class _RecordOps(TorchDispatchMode):
+    def __init__(self, dispatched_ops: list[str]) -> None:
+        super().__init__()
+        self.dispatched_ops = dispatched_ops
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        self.dispatched_ops.append(str(func))
+        return func(*args, **(kwargs or {}))
 
 
 def _full_fp32_linear(
@@ -322,6 +333,7 @@ def test_deepseek_hash_router_avoids_full_width_score_materialization() -> None:
         ),
     )
     reference.weight.data.normal_(std=0.02)
+    reference.weight.requires_grad_(False)
     reference.tid2eid.copy_(
         torch.randint(0, 256, reference.tid2eid.shape, device="cuda")
     )
@@ -333,10 +345,80 @@ def test_deepseek_hash_router_avoids_full_width_score_materialization() -> None:
     expected_logits, expected_weights, expected_indices = _deepseek_fp32_reference(
         reference, hidden, input_ids
     )
-    actual_logits, actual_weights, actual_indices = optimized(hidden, input_ids)
+    dispatches: list[str] = []
+    with _RecordOps(dispatches):
+        actual_logits, actual_weights, actual_indices = optimized(hidden, input_ids)
+
     torch.testing.assert_close(actual_indices, expected_indices, rtol=0, atol=0)
     assert actual_logits.dtype == torch.float32
+    assert actual_logits.shape == (2 * 17, 6)
     assert actual_weights.dtype == torch.float32
+    # The six selected logits are the only ones projected: no full-width expert
+    # GEMM or [tokens, 256] score tensor may be materialized.
+    assert not any(
+        op in dispatches
+        for op in (
+            "torch.ops.aten.mm.default",
+            "torch.ops.aten.addmm.default",
+            "torch.ops.aten.linear.default",
+            "torch.ops.aten.bmm.default",
+        )
+    )
     # Same intentional BF16 projection rounding as the other router tests.
-    _assert_relative_rmse(actual_logits, expected_logits, 1e-2)
+    _assert_relative_rmse(
+        actual_logits,
+        expected_logits.gather(1, expected_indices),
+        1e-2,
+    )
     _assert_selected_weights_close(actual_weights, expected_weights)
+
+
+def test_deepseek_hash_router_selected_logits_gradient_matches_reference() -> None:
+    torch.manual_seed(3141)
+    reference = cast(
+        Any,
+        DeepseekV4HashRouter(cast(Any, _deepseek_config())).to(
+            device="cuda", dtype=torch.bfloat16
+        ),
+    )
+    reference.weight.data.normal_(std=0.02)
+    reference.weight.requires_grad_(False)
+    reference.tid2eid.copy_(
+        torch.randint(0, 256, reference.tid2eid.shape, device="cuda")
+    )
+    optimized = deepcopy(reference)
+    configure_fast_moe_ranking(_RouterModel(optimized, scoring_func="sqrtsoftplus"))
+
+    input_ids = torch.randint(0, 512, (2, 17), device="cuda")
+    hidden_reference = torch.randn(
+        2, 17, 4096, device="cuda", dtype=torch.bfloat16, requires_grad=True
+    )
+    hidden_optimized = hidden_reference.detach().clone().requires_grad_(True)
+
+    _, weights_reference, _ = _deepseek_fp32_reference(
+        reference, hidden_reference, input_ids
+    )
+    _, weights_optimized, _ = optimized(hidden_optimized, input_ids)
+    _symmetric_weight_loss(weights_reference).backward()
+    _symmetric_weight_loss(weights_optimized).backward()
+
+    _assert_finite_nonzero_gradient(_require_grad(hidden_reference))
+    _assert_finite_nonzero_gradient(_require_grad(hidden_optimized))
+    _assert_relative_rmse(
+        _require_grad(hidden_optimized),
+        _require_grad(hidden_reference),
+        1e-2,
+    )
+
+
+def test_deepseek_hash_router_rejects_trainable_gate_weights() -> None:
+    router = cast(Any, DeepseekV4HashRouter(cast(Any, _deepseek_config()))).to(
+        device="cuda", dtype=torch.bfloat16
+    )
+    router.tid2eid.copy_(torch.randint(0, 256, router.tid2eid.shape, device="cuda"))
+    configure_fast_moe_ranking(_RouterModel(router, scoring_func="sqrtsoftplus"))
+
+    hidden = torch.randn(2, 17, 4096, device="cuda", dtype=torch.bfloat16)
+    input_ids = torch.randint(0, 512, (2, 17), device="cuda")
+    with pytest.raises(RuntimeError, match="frozen"):
+        router(hidden, input_ids)
