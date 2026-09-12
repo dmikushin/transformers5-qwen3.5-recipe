@@ -2,6 +2,7 @@ import math
 import os
 from collections import defaultdict
 from pathlib import Path
+from types import SimpleNamespace
 
 import gguf
 import numpy as np
@@ -10,6 +11,9 @@ import torch
 from liger_kernel.transformers.model.loss_utils import (
     LigerForCausalLMLoss,
     unpack_cross_entropy_result,
+)
+from liger_kernel.transformers.model.output_classes import (
+    LigerMoeCausalLMOutputWithPast,
 )
 from torch.utils._python_dispatch import TorchDispatchMode
 from transformers.integrations.gguf.gguf_quantized_parameter import (
@@ -20,7 +24,9 @@ from transformers.integrations.gguf.modules import GgufLinear
 from gguf_liger_loss import (
     _PACKED_LM_HEAD_CHUNK_SIZE,
     _packed_q8_liger_for_causal_lm_loss,
+    gguf_liger_lce_forward,
 )
+from packed_liger_loss import PackedLossResult
 
 _MODEL = Path(
     os.environ.get(
@@ -212,9 +218,81 @@ def test_packed_q8_liger_loss_rejects_higher_order_gradients(
         labels=labels,
         hidden_size=2048,
     )
+    assert isinstance(loss, torch.Tensor)
 
     with pytest.raises(
         RuntimeError,
         match="Packed Q8_1 GGUF LM-head loss does not support higher-order gradients",
     ):
         torch.autograd.grad(loss, hidden, create_graph=True)
+
+
+class _StubInnerModel(torch.nn.Module):
+    def __init__(self, hidden_states: torch.Tensor) -> None:
+        super().__init__()
+        self.hidden_states = hidden_states
+
+    def forward(self, **kwargs: object) -> SimpleNamespace:
+        return SimpleNamespace(last_hidden_state=self.hidden_states)
+
+
+class _StubForwardModel(torch.nn.Module):
+    """Minimal Qwen surface the scoped packed forward reads."""
+
+    def __init__(self, hidden_states: torch.Tensor) -> None:
+        super().__init__()
+        self.config = SimpleNamespace(
+            hidden_size=hidden_states.shape[-1],
+            output_attentions=False,
+            output_hidden_states=False,
+            output_router_logits=False,
+            return_dict=True,
+        )
+        self.vocab_size = 16
+        self.lm_head = GgufLinear(
+            hidden_states.shape[-1],
+            16,
+            bias=False,
+            device="cpu",
+            dtype=torch.bfloat16,
+            floating_weight=True,
+        )
+        self.num_experts = 2
+        self.num_experts_per_tok = 1
+        self.router_aux_loss_coef = 0.0
+        self.model = _StubInnerModel(hidden_states)
+
+    def loss_function(self, *args: object, **kwargs: object) -> torch.Tensor:
+        raise AssertionError("packed forward must not materialize logits")
+
+
+def test_qwen_forward_surfaces_optional_loss_outputs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    accuracy = torch.tensor(0.5)
+    predicted = torch.zeros(6, dtype=torch.long)
+
+    def packed_loss(**kwargs: object) -> PackedLossResult:
+        assert kwargs["return_token_accuracy"] is True
+        assert kwargs["return_predicted_tokens"] is True
+        return torch.tensor(2.0), None, accuracy, predicted
+
+    hidden = torch.zeros(2, 3, 8, dtype=torch.bfloat16)
+    model = _StubForwardModel(hidden)
+    labels = torch.zeros(2, 3, dtype=torch.long)
+    monkeypatch.setattr(
+        "gguf_liger_loss._packed_q8_liger_for_causal_lm_loss", packed_loss
+    )
+
+    output = gguf_liger_lce_forward(
+        model,
+        labels=labels,
+        return_token_accuracy=True,
+        return_predicted_tokens=True,
+    )
+
+    assert isinstance(output, LigerMoeCausalLMOutputWithPast)
+    assert output.loss is not None and float(output.loss) == 2.0
+    assert output.logits is None
+    assert output.token_accuracy is accuracy
+    assert output.predicted_tokens is predicted
