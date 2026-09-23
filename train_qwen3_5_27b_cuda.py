@@ -7,10 +7,14 @@ CUDA counterpart of ``train_qwen3_5_35b.py``. What differs, and why:
 * No MoE: the model is dense, so the grouped-MMQ LoRA, expert ranking and
   AITER gmm configs are not used.
 * No gfx1151 Triton autotune tables (``fla_tuning``, AITER configs).
-* The GGUF weights stay packed. LoRA-target projections whose quant type has
-  a CUDA MMQ kernel run through ``torch_ggml_ops.mmq`` in both directions;
-  the remaining projections (GatedDeltaNet in/out projections and the few
-  Q3_K / IQ3_S tensors) use the transformers fork's per-call dequantization.
+* RMSNorm / gated RMSNorm use the recipe's Liger / FLA kernels
+  (``qwen3_5_fused_norms``), as in the 35B recipe; the eager gated norm keeps
+  FP32 copies of [seq_len, 6144] tensors during the GatedDeltaNet recompute.
+* The GGUF weights stay packed. LoRA-target projections run through
+  ``torch_ggml_ops.mmq`` in both directions. The GatedDeltaNet projections
+  (not LoRA targets) use the fork's per-call dequantization; routing them
+  through MMQ as well was measured to change neither the 16k/24k peak nor
+  the step time, so it is not done.
 * The LM head (Q6_K, 248320 x 5120) is never materialized: the packed
   chunked Liger loss from ``gguf_liger_loss`` computes loss and dHidden.
 * ``--offload-checkpoints`` keeps the per-layer checkpointed hidden states
@@ -58,6 +62,12 @@ from bf16_adapter_trainer import BF16AdapterTrainer
 from fast_lora import FastGgufLoraLinear, register_fast_lora
 from gguf_dequant_compile import configure_compiled_gguf_dequantize
 from gguf_liger_loss import apply_gguf_liger_fused_linear_cross_entropy
+from qwen3_5_fused_norms import (
+    EXPECTED_DENSE_27B_GATED_RMSNORMS,
+    EXPECTED_DENSE_27B_RMSNORMS,
+    configure_qwen35_fused_norms,
+    require_complete_qwen35_fused_norms,
+)
 
 _DEFAULT_GGUF = (
     "~/.cache/huggingface/hub/models--unsloth--Qwen3.8-27B-GGUF/snapshots/*/"
@@ -178,6 +188,11 @@ def main() -> None:
         help="hold gradient-checkpoint inputs in pinned host memory",
     )
     parser.add_argument(
+        "--eager-norms",
+        action="store_true",
+        help="keep transformers' eager RMSNorms (for measuring what the fused ones save)",
+    )
+    parser.add_argument(
         "--tiled-mlp-shards",
         type=int,
         default=0,
@@ -211,6 +226,12 @@ def main() -> None:
         device_map={"": "cuda:0"},
     )
     model.config.use_cache = False
+    if not args.eager_norms:
+        require_complete_qwen35_fused_norms(
+            configure_qwen35_fused_norms(model),
+            expected_rmsnorms=EXPECTED_DENSE_27B_RMSNORMS,
+            expected_gated_rmsnorms=EXPECTED_DENSE_27B_GATED_RMSNORMS,
+        )
     # Enabled here rather than through TrainingArguments, which cannot request
     # offloading. The Trainer does not touch checkpointing when its flag is off.
     model.gradient_checkpointing_enable(

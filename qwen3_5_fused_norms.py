@@ -1,4 +1,4 @@
-"""Instance-local Liger RMSNorm and FLA gated RMSNorm for Qwen3.5-MoE training.
+"""Instance-local Liger RMSNorm and FLA gated RMSNorm for Qwen3.5 (MoE and dense) training.
 
 Transformers wires both norms through the `kernels` hub, but the hub mapping is only registered
 when a model is loaded with the opt-in `use_kernels=True`, and the `kernels-community/fla` layer
@@ -14,6 +14,9 @@ Semantics preserved:
 * `Qwen3_5MoeRMSNormGated` computes `weight * x_norm * silu(gate)` in FP32. FLA's contract for
   that is `FusedRMSNormGated`, i.e. `LayerNormGatedFunction` with `is_rms_norm=True`.
 
+The dense `Qwen3_5RMSNorm` / `Qwen3_5RMSNormGated` classes have the same forwards (checked
+textually against the MoE ones) and take the same kernels.
+
 The patched module classes, parameter names, shapes, and dtypes are unchanged, so PEFT
 serialization, the frozen-base contract, and the audit inventories stay valid. The shared
 patching protocol lives in `module_patching.py`.
@@ -24,6 +27,10 @@ from typing import Any
 import torch
 from fla.modules.fused_norm_gate import LayerNormGatedFunction
 from liger_kernel.ops import LigerRMSNormFunction
+from transformers.models.qwen3_5.modeling_qwen3_5 import (
+    Qwen3_5RMSNorm,
+    Qwen3_5RMSNormGated,
+)
 from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
     Qwen3_5MoeRMSNorm,
     Qwen3_5MoeRMSNormGated,
@@ -40,6 +47,10 @@ from module_patching import (
 # and one gated norm per GatedDeltaNet layer.
 EXPECTED_RMSNORMS = 101
 EXPECTED_GATED_RMSNORMS = 30
+# Dense Qwen3.8-27B: 64 input + 64 post-attention + 1 final + 16x2 Q/K head norms,
+# and one gated norm per each of the 48 GatedDeltaNet layers.
+EXPECTED_DENSE_27B_RMSNORMS = 161
+EXPECTED_DENSE_27B_GATED_RMSNORMS = 48
 _SUBJECT = "Qwen3.5 fused norm"
 _LIGER_OFFSET = 1.0
 _LIGER_CASTING_MODE = "gemma"
@@ -108,11 +119,23 @@ _SPECS = (
         handled_key="rmsnorms",
         validate=_validate_rmsnorm,
     ),
+    ModulePatchSpec(
+        module_type=Qwen3_5RMSNormGated,
+        forward=_fla_gated_rmsnorm_forward,
+        handled_key="gated_rmsnorms",
+        validate=_validate_gated_rmsnorm,
+    ),
+    ModulePatchSpec(
+        module_type=Qwen3_5RMSNorm,
+        forward=_liger_rmsnorm_forward,
+        handled_key="rmsnorms",
+        validate=_validate_rmsnorm,
+    ),
 )
 
 
 def configure_qwen35_fused_norms(model: torch.nn.Module) -> dict[str, Any]:
-    """Install the Liger and FLA kernels on one loaded Qwen3.5-MoE model."""
+    """Install the Liger and FLA kernels on one loaded Qwen3.5 (MoE or dense) model."""
 
     report = patch_module_forwards(model, _SPECS)
     report["liger"] = {
