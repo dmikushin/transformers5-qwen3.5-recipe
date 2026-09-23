@@ -108,6 +108,51 @@ def _packed_dataset(
     return Dataset.from_dict({"input_ids": [distinct[i % windows] for i in range(samples)]})
 
 
+def _completion_dataset(
+    tokenizer, jsonl: Path, seq_len: int, samples: int
+) -> Dataset:
+    """One record per window, loss on the REPLY tokens only.
+
+    The packed builder concatenates prompt and reply and trains on every
+    token, which teaches the adapter to reproduce the archive. For context
+    distillation the archive is the question and only the reply is the
+    answer: prompt positions are masked to -100 so the gradient pays for
+    recall, not for echoing what it was shown.
+
+    A record longer than seq_len keeps its TAIL — the reply must survive, and
+    the archive's most recent rows matter most.
+    """
+    rows = []
+    with jsonl.open(encoding="utf-8") as stream:
+        for line in stream:
+            record = json.loads(line)
+            prompt = str(record.get("prompt", ""))
+            reply = str(record.get("reply", ""))
+            p_ids = tokenizer(prompt + "\n", add_special_tokens=False).input_ids
+            r_ids = tokenizer(reply, add_special_tokens=False).input_ids
+            r_ids.append(tokenizer.eos_token_id)
+            ids = p_ids + r_ids
+            labels = [-100] * len(p_ids) + list(r_ids)
+            if len(ids) > seq_len:
+                ids, labels = ids[-seq_len:], labels[-seq_len:]
+            else:                                   # pad; padding is masked
+                pad = seq_len - len(ids)
+                ids = ids + [tokenizer.eos_token_id] * pad
+                labels = labels + [-100] * pad
+            rows.append((ids, labels))
+            if len(rows) >= samples:
+                break
+    if not rows:
+        raise RuntimeError(f"{jsonl} yielded no usable records")
+    sup = [sum(1 for x in lb if x != -100) for _, lb in rows]
+    print(f"completion-only: {len(rows)} records, window {seq_len}, "
+          f"supervised tokens per record min {min(sup)} median "
+          f"{sorted(sup)[len(sup)//2]} max {max(sup)}", flush=True)
+    return Dataset.from_dict({
+        "input_ids": [rows[i % len(rows)][0] for i in range(samples)],
+        "labels": [rows[i % len(rows)][1] for i in range(samples)]})
+
+
 def _configure_tiled_mlp(model: torch.nn.Module, shards: int) -> int:
     """Route every decoder MLP through TiledMLP with a fixed shard count."""
 
@@ -215,6 +260,8 @@ def main() -> None:
         type=Path,
         help="write a CUDA allocator trace of the second step to this pickle",
     )
+    parser.add_argument("--completion-only", action="store_true",
+                        help="one record per window, loss on the reply only")
     parser.add_argument("--seed", type=int, default=19260817)
     args = parser.parse_args()
 
@@ -270,9 +317,15 @@ def main() -> None:
     print(f"LoRA projections on packed MMQ: {on_mmq} / {len(wrappers)}", flush=True)
 
     samples = args.max_steps * args.grad_accum
-    dataset = _packed_dataset(
-        tokenizer, args.text_jsonl.expanduser(), args.seq_len, samples, args.windows
-    )
+    if args.completion_only:
+        dataset = _completion_dataset(
+            tokenizer, args.text_jsonl.expanduser(), args.seq_len, samples
+        )
+    else:
+        dataset = _packed_dataset(
+            tokenizer, args.text_jsonl.expanduser(), args.seq_len, samples,
+            args.windows
+        )
     args.output_dir.mkdir(parents=True, exist_ok=True)
     metrics_path = args.output_dir / "step_metrics.jsonl"
     metrics_path.unlink(missing_ok=True)
