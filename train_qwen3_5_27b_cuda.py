@@ -60,7 +60,6 @@ from transformers import (
 
 from bf16_adapter_trainer import BF16AdapterTrainer
 from fast_lora import FastGgufLoraLinear, register_fast_lora
-from gguf_dequant_compile import configure_compiled_gguf_dequantize
 from gguf_liger_loss import apply_gguf_liger_fused_linear_cross_entropy
 from qwen3_5_fused_norms import (
     EXPECTED_DENSE_27B_GATED_RMSNORMS,
@@ -76,13 +75,19 @@ _DEFAULT_GGUF = (
 _GIB = 2**30
 
 
-def _packed_dataset(tokenizer, jsonl: Path, seq_len: int, samples: int) -> Dataset:
-    """Concatenate prompt/reply text and cut it into ``samples`` full windows."""
+def _packed_dataset(
+    tokenizer, jsonl: Path, seq_len: int, samples: int, windows: int | None = None
+) -> Dataset:
+    """Concatenate prompt/reply text into ``windows`` distinct full windows and
+    cycle through them for ``samples`` samples (default: all distinct)."""
 
+    windows = samples if windows is None else min(windows, samples)
     ids: list[int] = []
-    needed = seq_len * samples
+    needed = seq_len * windows
+    records = 0
     with jsonl.open(encoding="utf-8") as stream:
         for line in stream:
+            records += 1
             record = json.loads(line)
             text = "\n".join(str(record[key]) for key in ("prompt", "reply") if key in record)
             ids.extend(tokenizer(text, add_special_tokens=False).input_ids)
@@ -91,10 +96,16 @@ def _packed_dataset(tokenizer, jsonl: Path, seq_len: int, samples: int) -> Datas
                 break
     if len(ids) < needed:
         raise RuntimeError(
-            f"{jsonl} yields {len(ids)} tokens, fewer than {samples} x {seq_len}"
+            f"{jsonl} yields {len(ids)} tokens, fewer than {windows} x {seq_len}"
         )
-    windows = [ids[i * seq_len : (i + 1) * seq_len] for i in range(samples)]
-    return Dataset.from_dict({"input_ids": windows})
+    distinct = [ids[i * seq_len : (i + 1) * seq_len] for i in range(windows)]
+    lengths = sorted({len(window) for window in distinct})
+    print(
+        f"packed {records} records ({len(ids)} tokens) into {windows} windows; "
+        f"window lengths {lengths}",
+        flush=True,
+    )
+    return Dataset.from_dict({"input_ids": [distinct[i % windows] for i in range(samples)]})
 
 
 def _configure_tiled_mlp(model: torch.nn.Module, shards: int) -> int:
@@ -115,6 +126,7 @@ def _configure_tiled_mlp(model: torch.nn.Module, shards: int) -> int:
 
 def _collate(examples):
     input_ids = torch.tensor([example["input_ids"] for example in examples], dtype=torch.long)
+    print(f"batch input_ids shape {tuple(input_ids.shape)}", flush=True)
     return {
         "input_ids": input_ids,
         "attention_mask": torch.ones_like(input_ids),
@@ -173,15 +185,15 @@ def main() -> None:
     parser.add_argument("--seq-len", type=int, default=4096)
     parser.add_argument("--max-steps", type=int, default=4)
     parser.add_argument("--grad-accum", type=int, default=1)
+    parser.add_argument(
+        "--windows",
+        type=int,
+        help="distinct text windows to cycle through (default: one per sample)",
+    )
     parser.add_argument("--lora-rank", type=int, default=16)
     parser.add_argument("--lora-alpha", type=int, default=32)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--output-dir", type=Path, default=Path("out_qwen38_27b_cuda"))
-    parser.add_argument(
-        "--compile-dequant",
-        action="store_true",
-        help="torch.compile the fork's dequantizer used by the non-MMQ projections",
-    )
     parser.add_argument(
         "--offload-checkpoints",
         action="store_true",
@@ -211,8 +223,6 @@ def main() -> None:
         raise FileNotFoundError(args.gguf)
     gguf_path = Path(matches[0])
     set_seed(args.seed)
-    if args.compile_dequant:
-        configure_compiled_gguf_dequantize()
 
     tokenizer = AutoTokenizer.from_pretrained(
         gguf_path.parent, gguf_file=gguf_path.name, local_files_only=True
@@ -260,7 +270,9 @@ def main() -> None:
     print(f"LoRA projections on packed MMQ: {on_mmq} / {len(wrappers)}", flush=True)
 
     samples = args.max_steps * args.grad_accum
-    dataset = _packed_dataset(tokenizer, args.text_jsonl.expanduser(), args.seq_len, samples)
+    dataset = _packed_dataset(
+        tokenizer, args.text_jsonl.expanduser(), args.seq_len, samples, args.windows
+    )
     args.output_dir.mkdir(parents=True, exist_ok=True)
     metrics_path = args.output_dir / "step_metrics.jsonl"
     metrics_path.unlink(missing_ok=True)
