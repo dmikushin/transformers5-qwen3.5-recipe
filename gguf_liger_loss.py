@@ -1,12 +1,14 @@
-"""Packed GGUF-aware Liger-style cross-entropy for Qwen3.5-MoE.
+"""Packed GGUF-aware Liger-style cross-entropy for Qwen3.5-MoE and dense Qwen3.5.
 
 The frozen LM head remains in its authoritative GGUF representation. The shared
-``packed_liger_loss`` module owns the chunked Q8_1 MMQ, the in-place Liger
+``packed_liger_loss`` module owns the chunked MMQ, the in-place Liger
 cross-entropy, the packed logical input Jacobian, and the scoped-forward
-contract. This module owns the Qwen entry points and its validated constants
-(hidden size 2048, Q6_K head, 256-row chunks).
+contract. This module owns the Qwen entry points and their validated constants
+(Q6_K head, 256-row chunks; hidden size 2048 for Qwen3.6-35B-A3B and 5120 for
+the dense Qwen3.8-27B).
 """
 
+from functools import partial
 from types import MethodType
 from typing import cast
 
@@ -16,7 +18,8 @@ from liger_kernel.transformers.model.output_classes import (
 )
 from transformers.cache_utils import Cache
 from transformers.integrations.gguf.modules import GgufLinear
-from transformers.modeling_outputs import MoeModelOutputWithPast
+from transformers.modeling_outputs import BaseModelOutputWithPast, MoeModelOutputWithPast
+from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForCausalLM
 from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
     Qwen3_5MoeForCausalLM,
     load_balancing_loss_func,
@@ -35,13 +38,15 @@ _PACKED_LM_HEAD_QUANT_TYPE = 14
 _PACKED_LM_HEAD_QUANT_NAME = "Q6_K"
 _PACKED_LM_HEAD_LOSS_NAME = "Packed GGUF LM-head loss"
 _PACKED_LM_HEAD_HIDDEN_SIZE = 2048
+_PACKED_DENSE_LM_HEAD_HIDDEN_SIZE = 5120
 
 
-def _packed_q8_liger_for_causal_lm_loss(
+def _packed_liger_loss_for_hidden_size(
     hidden_states: torch.Tensor,
     lm_head: GgufLinear,
     labels: torch.Tensor,
     hidden_size: int,
+    expected_hidden_size: int,
     num_items_in_batch: int | torch.Tensor | None = None,
     ignore_index: int = -100,
     shift_labels: torch.Tensor | None = None,
@@ -59,7 +64,7 @@ def _packed_q8_liger_for_causal_lm_loss(
         expected_quant_type=_PACKED_LM_HEAD_QUANT_TYPE,
         quant_name=_PACKED_LM_HEAD_QUANT_NAME,
         loss_name=_PACKED_LM_HEAD_LOSS_NAME,
-        expected_hidden_size=_PACKED_LM_HEAD_HIDDEN_SIZE,
+        expected_hidden_size=expected_hidden_size,
         num_items_in_batch=num_items_in_batch,
         ignore_index=ignore_index,
         shift_labels=shift_labels,
@@ -68,6 +73,17 @@ def _packed_q8_liger_for_causal_lm_loss(
         return_predicted_tokens=return_predicted_tokens,
         **kwargs,
     )
+
+
+# ``scoped_packed_causal_lm_loss`` passes every argument by keyword.
+_packed_q8_liger_for_causal_lm_loss = partial(
+    _packed_liger_loss_for_hidden_size,
+    expected_hidden_size=_PACKED_LM_HEAD_HIDDEN_SIZE,
+)
+_packed_dense_liger_for_causal_lm_loss = partial(
+    _packed_liger_loss_for_hidden_size,
+    expected_hidden_size=_PACKED_DENSE_LM_HEAD_HIDDEN_SIZE,
+)
 
 
 @can_return_tuple
@@ -160,21 +176,78 @@ def gguf_liger_lce_forward(
     )
 
 
+@can_return_tuple
+def gguf_liger_lce_forward_dense(
+    self: Qwen3_5ForCausalLM,
+    input_ids: torch.Tensor | None = None,
+    attention_mask: torch.Tensor | None = None,
+    position_ids: torch.Tensor | None = None,
+    past_key_values: Cache | None = None,
+    inputs_embeds: torch.Tensor | None = None,
+    labels: torch.Tensor | None = None,
+    use_cache: bool | None = None,
+    output_attentions: bool | None = None,
+    output_hidden_states: bool | None = None,
+    cache_position: torch.Tensor | None = None,
+    logits_to_keep: int | torch.Tensor = 0,
+    skip_logits: bool | None = None,
+    shift_labels: torch.Tensor | None = None,
+    **kwargs: object,
+) -> LigerMoeCausalLMOutputWithPast:
+    """Dense Qwen3.5 forward using the chunked packed GGUF LM-head loss."""
+
+    outputs: BaseModelOutputWithPast = self.model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        position_ids=position_ids,
+        past_key_values=past_key_values,
+        inputs_embeds=inputs_embeds,
+        use_cache=use_cache,
+        output_attentions=output_attentions,
+        output_hidden_states=output_hidden_states,
+        cache_position=cache_position,
+        **kwargs,
+    )
+
+    loss, logits, token_accuracy, predicted_tokens = scoped_packed_causal_lm_loss(
+        self,
+        outputs,
+        labels=labels,
+        shift_labels=shift_labels,
+        logits_to_keep=logits_to_keep,
+        skip_logits=skip_logits,
+        packed_loss=_packed_dense_liger_for_causal_lm_loss,
+        loss_kwargs=kwargs,
+    )
+    return assembled_scoped_output(
+        outputs,
+        loss=loss,
+        aux_loss=None,
+        logits=logits,
+        token_accuracy=token_accuracy,
+        predicted_tokens=predicted_tokens,
+    )
+
+
 def apply_gguf_liger_fused_linear_cross_entropy(
     model: torch.nn.Module,
-) -> Qwen3_5MoeForCausalLM:
+) -> Qwen3_5MoeForCausalLM | Qwen3_5ForCausalLM:
     """Patch one loaded text model with the GGUF-aware Liger loss forward."""
 
     get_base_model = getattr(model, "get_base_model", None)
     target = get_base_model() if callable(get_base_model) else model
-    if not isinstance(target, Qwen3_5MoeForCausalLM):
+    if isinstance(target, Qwen3_5MoeForCausalLM):
+        forward = gguf_liger_lce_forward
+    elif isinstance(target, Qwen3_5ForCausalLM):
+        forward = gguf_liger_lce_forward_dense
+    else:
         raise TypeError(
-            "GGUF-aware Liger loss requires Qwen3_5MoeForCausalLM after unwrapping PEFT, "
-            f"got {type(target).__name__}."
+            "GGUF-aware Liger loss requires Qwen3_5MoeForCausalLM or Qwen3_5ForCausalLM "
+            f"after unwrapping PEFT, got {type(target).__name__}."
         )
     if not isinstance(target.lm_head, GgufLinear):
         raise TypeError(
             f"GGUF-aware Liger loss requires GgufLinear, got {type(target.lm_head).__name__}."
         )
-    target.forward = MethodType(gguf_liger_lce_forward, target)
+    target.forward = MethodType(forward, target)
     return target

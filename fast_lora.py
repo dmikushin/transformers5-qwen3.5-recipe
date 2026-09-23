@@ -17,7 +17,7 @@ import torch
 from peft import LoraConfig
 from peft.tuners.lora.layer import VARIANT_KWARG_KEYS
 from peft.tuners.lora.layer import Linear as PeftLinear
-from torch_ggml_ops import mmq
+from torch_ggml_ops import DENSE_MMQ_QUANT_TYPES, mmq
 from transformers.integrations.gguf.gguf_quantized_parameter import (
     GgufQuantizedParameter,
 )
@@ -139,9 +139,10 @@ class FastGgufLoraLinear(FastLoraLinear):
     """Fast LoRA wrapper for frozen packed ``GgufLinear`` modules.
 
     Permutation-free packed weights of ordinary projections use exported dense MMQ in both
-    directions. Fused recurrent projections and modules with a runtime layout permutation use
-    the generic compiled-dequant base forward. Kernel support is authoritative in
-    ``torch-ggml-ops`` and is not probed here.
+    directions. Fused recurrent projections, modules with a runtime layout permutation, and
+    quant types outside ``torch_ggml_ops.DENSE_MMQ_QUANT_TYPES`` use the generic
+    compiled-dequant base forward. Shape support is authoritative in ``torch-ggml-ops`` and
+    is not probed here.
     """
 
     def packed_mmq_weight(self) -> GgufQuantizedParameter | None:
@@ -152,6 +153,10 @@ class FastGgufLoraLinear(FastLoraLinear):
         if not isinstance(weight, GgufQuantizedParameter) or getattr(
             base, _GENERIC_PACKED_FORWARD_ATTR, False
         ):
+            return None
+        # Checkpoints mix quant types per tensor (e.g. UD-Q4_K_XL); a type the
+        # backend has no MMQ kernel for keeps the generic dequant forward.
+        if int(weight.quant_type) not in DENSE_MMQ_QUANT_TYPES:
             return None
         return weight
 

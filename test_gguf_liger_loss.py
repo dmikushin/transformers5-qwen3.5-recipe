@@ -23,6 +23,7 @@ from transformers.integrations.gguf.modules import GgufLinear
 
 from gguf_liger_loss import (
     _PACKED_LM_HEAD_CHUNK_SIZE,
+    _packed_dense_liger_for_causal_lm_loss,
     _packed_q8_liger_for_causal_lm_loss,
     gguf_liger_lce_forward,
 )
@@ -54,6 +55,14 @@ class _MMQCounter(TorchDispatchMode):
         return func(*args, **(kwargs or {}))
 
 
+# The packed loss entry point validated for each model's hidden size:
+# Qwen3.6-35B-A3B (2048) and the dense Qwen3.8-27B (5120).
+_PACKED_LOSS_BY_HIDDEN = {
+    2048: _packed_q8_liger_for_causal_lm_loss,
+    5120: _packed_dense_liger_for_causal_lm_loss,
+}
+
+
 @pytest.fixture(scope="module")
 def q6_lm_head() -> GgufLinear:
     if not _MODEL.is_file():
@@ -61,10 +70,11 @@ def q6_lm_head() -> GgufLinear:
     reader = gguf.GGUFReader(_MODEL)
     tensor = next(tensor for tensor in reader.tensors if tensor.name == "output.weight")
     out_features = int(tensor.data.shape[0])
+    hidden = int(tensor.shape[0])
     packed_host = np.array(tensor.data, dtype=np.uint8, copy=True, order="C")
     packed = torch.from_numpy(packed_host).to("cuda")
     module = GgufLinear(
-        2048,
+        hidden,
         out_features,
         bias=False,
         device="cuda",
@@ -74,9 +84,13 @@ def q6_lm_head() -> GgufLinear:
     module.weight = GgufQuantizedParameter(
         packed,
         quant_type=tensor.tensor_type,
-        logical_shape=(out_features, 2048),
+        logical_shape=(out_features, hidden),
     )
     return module
+
+
+def _packed_loss(lm_head: GgufLinear):
+    return _PACKED_LOSS_BY_HIDDEN[lm_head.in_features]
 
 
 def test_packed_q8_liger_loss_matches_logical_reference_and_uses_native_ops(
@@ -88,7 +102,7 @@ def test_packed_q8_liger_loss_matches_logical_reference_and_uses_native_ops(
     hidden_reference = torch.randn(
         1,
         rows,
-        2048,
+        q6_lm_head.in_features,
         generator=generator,
         device="cuda",
         dtype=torch.bfloat16,
@@ -111,7 +125,7 @@ def test_packed_q8_liger_loss_matches_logical_reference_and_uses_native_ops(
         hidden_states=hidden_reference,
         lm_head_weight=logical_weight,
         labels=labels,
-        hidden_size=2048,
+        hidden_size=q6_lm_head.in_features,
         return_token_accuracy=True,
         return_predicted_tokens=True,
     )
@@ -129,11 +143,11 @@ def test_packed_q8_liger_loss_matches_logical_reference_and_uses_native_ops(
     )
     counter = _MMQCounter()
     with counter:
-        packed_result = _packed_q8_liger_for_causal_lm_loss(
+        packed_result = _packed_loss(q6_lm_head)(
             hidden_states=hidden_packed,
             lm_head=q6_lm_head,
             labels=labels,
-            hidden_size=2048,
+            hidden_size=q6_lm_head.in_features,
             return_token_accuracy=True,
             return_predicted_tokens=True,
         )
@@ -192,15 +206,15 @@ def test_packed_q8_liger_loss_rejects_unsupported_objectives(
     loss_kwargs: dict,
     message: str,
 ) -> None:
-    hidden = torch.randn(1, 2, 2048, device="cuda", dtype=torch.bfloat16)
+    hidden = torch.randn(1, 2, q6_lm_head.in_features, device="cuda", dtype=torch.bfloat16)
     labels = torch.tensor([[3, 5]], device="cuda")
 
     with pytest.raises(RuntimeError, match=message):
-        _packed_q8_liger_for_causal_lm_loss(
+        _packed_loss(q6_lm_head)(
             hidden_states=hidden,
             lm_head=q6_lm_head,
             labels=labels,
-            hidden_size=2048,
+            hidden_size=q6_lm_head.in_features,
             **loss_kwargs,
         )
 
@@ -209,14 +223,14 @@ def test_packed_q8_liger_loss_rejects_higher_order_gradients(
     q6_lm_head: GgufLinear,
 ) -> None:
     hidden = torch.randn(
-        1, 64, 2048, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        1, 64, q6_lm_head.in_features, device="cuda", dtype=torch.bfloat16, requires_grad=True
     )
     labels = torch.randint(0, q6_lm_head.out_features, (1, 64), device="cuda")
-    loss = _packed_q8_liger_for_causal_lm_loss(
+    loss = _packed_loss(q6_lm_head)(
         hidden_states=hidden,
         lm_head=q6_lm_head,
         labels=labels,
-        hidden_size=2048,
+        hidden_size=q6_lm_head.in_features,
     )
     assert isinstance(loss, torch.Tensor)
 

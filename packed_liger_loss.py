@@ -3,11 +3,12 @@
 Qwen3.5-MoE and DeepSeek V4 both keep the LM head in its authoritative GGUF
 representation and train through the same calculation:
 
-1. quantize bounded BF16 hidden-state chunks to Q8_1,
-2. multiply them by the packed head with native MMQ,
-3. run Liger's cross-entropy kernel in place so its BF16 logits become
+1. multiply bounded BF16 hidden-state chunks by the packed head with native
+   MMQ (the ROCm kernels quantize each chunk to Q8_1 first; the CUDA kernels
+   multiply BF16 directly),
+2. run Liger's cross-entropy kernel in place so its BF16 logits become
    cotangents,
-4. decode the frozen packed input Jacobian directly into the hidden gradient.
+3. decode the frozen packed input Jacobian directly into the hidden gradient.
 
 No logical LM-head matrix or full-sequence logits tensor is materialized. The
 model-specific modules own their public entry points, validation constants
@@ -37,6 +38,7 @@ from liger_kernel.transformers.model.output_classes import (
 )
 from torch import nn
 from torch_ggml_ops import mmq_grad_input_inplace, mmq_inplace
+from torch_ggml_ops.runtime_contract import quant_workspace_elements
 from transformers.integrations.gguf.gguf_quantized_parameter import (
     GgufQuantizedParameter,
 )
@@ -166,7 +168,7 @@ def _packed_q8_linear_cross_entropy_forward(
         (buffer_rows, out_features), dtype=input.dtype, device=input.device
     )
     workspace_buffer = torch.empty(
-        buffer_rows * hidden_size // 128 * 144,
+        quant_workspace_elements(buffer_rows * hidden_size),
         dtype=torch.uint8,
         device=input.device,
     )
@@ -187,7 +189,9 @@ def _packed_q8_linear_cross_entropy_forward(
         input_chunk = input[start:end]
         chunk_rows = end - start
         logits_chunk = logits_buffer[:chunk_rows]
-        workspace_chunk = workspace_buffer[: chunk_rows * hidden_size // 128 * 144]
+        workspace_chunk = workspace_buffer[
+            : quant_workspace_elements(chunk_rows * hidden_size)
+        ]
         mmq_inplace(
             input_chunk,
             packed_weight,

@@ -31,6 +31,7 @@ def test_fast_lora_keeps_original_bf16_input_and_exact_base_jacobian() -> None:
 
     reader = gguf.GGUFReader(_MODEL)
     tensor = next(t for t in reader.tensors if t.name == "blk.0.attn_gate.weight")
+    in_features = int(tensor.shape[0])
     out_features = 512
     payload = torch.from_numpy(
         np.array(tensor.data[:out_features], dtype=np.uint8, copy=True, order="C")
@@ -38,14 +39,14 @@ def test_fast_lora_keeps_original_bf16_input_and_exact_base_jacobian() -> None:
     packed = GgufQuantizedParameter(
         payload,
         quant_type=tensor.tensor_type,
-        logical_shape=(out_features, 2048),
+        logical_shape=(out_features, in_features),
     )
 
     class Toy(torch.nn.Module):
         def __init__(self) -> None:
             super().__init__()
             self.proj = GgufLinear(
-                2048,
+                in_features,
                 out_features,
                 bias=False,
                 device="cuda",
@@ -78,7 +79,7 @@ def test_fast_lora_keeps_original_bf16_input_and_exact_base_jacobian() -> None:
     input = torch.randn(
         1,
         2048,
-        2048,
+        in_features,
         generator=generator,
         device="cuda",
         dtype=torch.bfloat16,
@@ -114,7 +115,7 @@ def test_fast_lora_keeps_original_bf16_input_and_exact_base_jacobian() -> None:
         tensor.tensor_type,
         dtype=torch.bfloat16,
         device="cuda",
-    ).reshape(out_features, 2048)
+    ).reshape(out_features, in_features)
     input_ref = input.detach().clone().requires_grad_(True)
     a_ref = layer.lora_A["default"].weight.detach().clone().requires_grad_(True)
     b_ref = layer.lora_B["default"].weight.detach().clone().requires_grad_(True)
@@ -157,6 +158,7 @@ def test_fast_lora_gdn_projection_uses_generic_dequant_forward() -> None:
 
     reader = gguf.GGUFReader(_MODEL)
     tensor = next(t for t in reader.tensors if t.name == "blk.0.attn_gate.weight")
+    in_features = int(tensor.shape[0])
     out_features = 512
     payload = torch.from_numpy(
         np.array(tensor.data[:out_features], dtype=np.uint8, copy=True, order="C")
@@ -164,7 +166,7 @@ def test_fast_lora_gdn_projection_uses_generic_dequant_forward() -> None:
     packed = GgufQuantizedParameter(
         payload,
         quant_type=tensor.tensor_type,
-        logical_shape=(out_features, 2048),
+        logical_shape=(out_features, in_features),
     )
 
     class LinearAttention(torch.nn.Module):
@@ -173,7 +175,7 @@ def test_fast_lora_gdn_projection_uses_generic_dequant_forward() -> None:
         def __init__(self) -> None:
             super().__init__()
             self.in_proj_z = GgufLinear(
-                2048,
+                in_features,
                 out_features,
                 bias=False,
                 device="cuda",
@@ -213,7 +215,7 @@ def test_fast_lora_gdn_projection_uses_generic_dequant_forward() -> None:
     input = torch.randn(
         1,
         2048,
-        2048,
+        in_features,
         generator=generator,
         device="cuda",
         dtype=torch.bfloat16,
@@ -246,7 +248,7 @@ def test_fast_lora_gdn_projection_uses_generic_dequant_forward() -> None:
         tensor.tensor_type,
         dtype=torch.bfloat16,
         device="cuda",
-    ).reshape(out_features, 2048)
+    ).reshape(out_features, in_features)
     input_ref = input.detach().clone().requires_grad_(True)
     a_ref = layer.lora_A["default"].weight.detach().clone().requires_grad_(True)
     b_ref = layer.lora_B["default"].weight.detach().clone().requires_grad_(True)
